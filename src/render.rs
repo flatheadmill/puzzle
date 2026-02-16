@@ -68,7 +68,7 @@ fn render_thinking(lines: &mut Vec<Line<'static>>, text: &str, width: u16) {
     ]));
 
     // prefix "  │ " is 4 columns, wrap thinking text to fit
-    let available = (width as usize).saturating_sub(4);
+    let available = (width as usize).saturating_sub(4).max(1);
 
     for line in text.lines() {
         if line.is_empty() {
@@ -77,26 +77,15 @@ fn render_thinking(lines: &mut Vec<Line<'static>>, text: &str, width: u16) {
             ]));
             continue;
         }
-        for wrapped in wrap_line(line, available) {
+        for wrapped in textwrap::wrap(line, available) {
             lines.push(Line::from(vec![
                 Span::styled("  \u{2502} ", marker_style),
-                Span::styled(wrapped, style),
+                Span::styled(wrapped.into_owned(), style),
             ]));
         }
     }
 
     lines.push(Line::from(Span::styled("  \u{2502}", marker_style)));
-}
-
-fn wrap_line(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= width {
-        return vec![text.to_string()];
-    }
-    chars.chunks(width).map(|chunk| chunk.iter().collect()).collect()
 }
 
 fn render_text(lines: &mut Vec<Line<'static>>, text: &str, kind: &EntryKind) {
