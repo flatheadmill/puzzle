@@ -18,6 +18,7 @@ pub enum EntryKind {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // timestamp, uuid, token counts parsed but not yet displayed
 pub struct ConversationEntry {
     pub kind: EntryKind,
     pub blocks: Vec<ContentBlock>,

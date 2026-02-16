@@ -1,9 +1,15 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+// Serde types below parse the full JSONL schema. Many fields and variants are
+// not yet consumed by the model/renderer but exist so deserialization succeeds
+// and the data is available as rendering gets richer. The allow(dead_code)
+// annotations reflect this — they are intentional, not deferred cleanup.
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
 pub enum Entry {
     User(UserEntry),
     Assistant(AssistantEntry),
@@ -19,6 +25,7 @@ pub enum Entry {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct UserEntry {
     pub message: UserMessage,
     pub uuid: Option<String>,
@@ -30,6 +37,7 @@ pub struct UserEntry {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct UserMessage {
     pub role: String,
     pub content: UserContent,
@@ -53,6 +61,7 @@ pub enum UserContentBlock {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ToolResultBlock {
     pub tool_use_id: Option<String>,
     pub content: Option<ToolResultContent>,
@@ -62,6 +71,7 @@ pub struct ToolResultBlock {
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
+#[allow(dead_code)]
 pub enum ToolResultContent {
     Text(String),
     Blocks(Vec<Value>),
@@ -69,6 +79,7 @@ pub enum ToolResultContent {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct AssistantEntry {
     pub message: AssistantMessage,
     pub uuid: Option<String>,
@@ -80,6 +91,7 @@ pub struct AssistantEntry {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct AssistantMessage {
     pub role: Option<String>,
     pub content: Vec<AssistantContentBlock>,
@@ -89,6 +101,7 @@ pub struct AssistantMessage {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -108,6 +121,7 @@ pub enum AssistantContentBlock {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ThinkingBlock {
     pub thinking: String,
     pub signature: Option<String>,
@@ -119,6 +133,7 @@ pub struct TextBlock {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ToolUseBlock {
     pub id: Option<String>,
     pub name: String,
@@ -127,6 +142,7 @@ pub struct ToolUseBlock {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct SystemEntry {
     pub subtype: Option<String>,
     #[serde(flatten)]
@@ -134,6 +150,7 @@ pub struct SystemEntry {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ProgressEntry {
     #[serde(flatten)]
     pub extra: Value,
@@ -141,18 +158,21 @@ pub struct ProgressEntry {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct SummaryEntry {
     pub summary: Option<String>,
     pub leaf_uuid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct FileHistorySnapshotEntry {
     #[serde(flatten)]
     pub extra: Value,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct QueueOperationEntry {
     #[serde(flatten)]
     pub extra: Value,
@@ -160,6 +180,7 @@ pub struct QueueOperationEntry {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct CustomTitleEntry {
     pub custom_title: Option<String>,
     pub session_id: Option<String>,
