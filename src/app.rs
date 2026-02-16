@@ -3,15 +3,32 @@ use ratatui::widgets::ListState;
 
 use crate::model::ConversationEntry;
 
+#[derive(PartialEq)]
+pub enum Mode {
+    Scroll,
+    Input,
+}
+
+#[derive(PartialEq)]
+pub enum RunState {
+    Idle,
+    Running,
+}
+
 pub struct App {
     pub entries: Vec<ConversationEntry>,
     pub list_state: ListState,
     pub follow: bool,
     pub should_quit: bool,
+    pub mode: Mode,
+    pub run_state: RunState,
+    pub input: String,
+    pub cursor_pos: usize,
+    pub repl_mode: bool,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(repl_mode: bool) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         Self {
@@ -19,6 +36,11 @@ impl App {
             list_state,
             follow: true,
             should_quit: false,
+            mode: if repl_mode { Mode::Input } else { Mode::Scroll },
+            run_state: RunState::Idle,
+            input: String::new(),
+            cursor_pos: 0,
+            repl_mode,
         }
     }
 
@@ -29,11 +51,84 @@ impl App {
         }
     }
 
+    pub fn submit_input(&mut self) -> Option<String> {
+        if self.input.trim().is_empty() {
+            return None;
+        }
+        let prompt = self.input.clone();
+        self.input.clear();
+        self.cursor_pos = 0;
+        Some(prompt)
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
+        match self.mode {
+            Mode::Input => self.handle_input_key(key),
+            Mode::Scroll => self.handle_scroll_key(key),
+        }
+    }
+
+    fn handle_input_key(&mut self, key: KeyEvent) {
+        if self.run_state == RunState::Running {
+            // only allow escape and ctrl-c while running
+            match key.code {
+                KeyCode::Esc => self.mode = Mode::Scroll,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.should_quit = true
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Scroll,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true
+            }
+            KeyCode::Enter => {
+                // submit is handled by the caller checking submit_input
+                // we just signal by leaving the input as-is
+            }
+            KeyCode::Char(c) => {
+                self.input.insert(self.cursor_pos, c);
+                self.cursor_pos += 1;
+            }
+            KeyCode::Backspace => {
+                if self.cursor_pos > 0 {
+                    self.cursor_pos -= 1;
+                    self.input.remove(self.cursor_pos);
+                }
+            }
+            KeyCode::Delete => {
+                if self.cursor_pos < self.input.len() {
+                    self.input.remove(self.cursor_pos);
+                }
+            }
+            KeyCode::Left => {
+                self.cursor_pos = self.cursor_pos.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                self.cursor_pos = (self.cursor_pos + 1).min(self.input.len());
+            }
+            KeyCode::Home => {
+                self.cursor_pos = 0;
+            }
+            KeyCode::End => {
+                self.cursor_pos = self.input.len();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_scroll_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true
+            }
+            KeyCode::Char('i') if self.repl_mode => {
+                self.mode = Mode::Input;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.scroll_down(1);

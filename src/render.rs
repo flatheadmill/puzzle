@@ -3,7 +3,7 @@ use ratatui::text::{Line, Span};
 
 use crate::model::{ContentBlock, ConversationEntry, EntryKind};
 
-pub fn render_entry(entry: &ConversationEntry) -> Vec<Line<'static>> {
+pub fn render_entry(entry: &ConversationEntry, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     match entry.kind {
@@ -37,7 +37,7 @@ pub fn render_entry(entry: &ConversationEntry) -> Vec<Line<'static>> {
     for block in &entry.blocks {
         match block {
             ContentBlock::Thinking { text } => {
-                render_thinking(&mut lines, text);
+                render_thinking(&mut lines, text, width);
             }
             ContentBlock::Text { text } => {
                 render_text(&mut lines, text, &entry.kind);
@@ -58,7 +58,7 @@ pub fn render_entry(entry: &ConversationEntry) -> Vec<Line<'static>> {
     lines
 }
 
-fn render_thinking(lines: &mut Vec<Line<'static>>, text: &str) {
+fn render_thinking(lines: &mut Vec<Line<'static>>, text: &str, width: u16) {
     let style = Style::default().fg(Color::DarkGray);
     let marker_style = Style::default().fg(Color::Cyan);
 
@@ -67,14 +67,36 @@ fn render_thinking(lines: &mut Vec<Line<'static>>, text: &str) {
         Span::styled("thinking", style.add_modifier(Modifier::ITALIC)),
     ]));
 
+    // prefix "  │ " is 4 columns, wrap thinking text to fit
+    let available = (width as usize).saturating_sub(4);
+
     for line in text.lines() {
-        lines.push(Line::from(vec![
-            Span::styled("  \u{2502} ", marker_style),
-            Span::styled(line.to_string(), style),
-        ]));
+        if line.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("  \u{2502} ", marker_style),
+            ]));
+            continue;
+        }
+        for wrapped in wrap_line(line, available) {
+            lines.push(Line::from(vec![
+                Span::styled("  \u{2502} ", marker_style),
+                Span::styled(wrapped, style),
+            ]));
+        }
     }
 
     lines.push(Line::from(Span::styled("  \u{2502}", marker_style)));
+}
+
+fn wrap_line(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= width {
+        return vec![text.to_string()];
+    }
+    chars.chunks(width).map(|chunk| chunk.iter().collect()).collect()
 }
 
 fn render_text(lines: &mut Vec<Line<'static>>, text: &str, kind: &EntryKind) {

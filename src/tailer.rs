@@ -12,6 +12,14 @@ pub async fn run_tailer(
     path: PathBuf,
     tx: mpsc::Sender<ConversationEntry>,
 ) -> color_eyre::Result<()> {
+    // poll for the file to appear (REPL mode creates it on first call)
+    loop {
+        if path.exists() {
+            break;
+        }
+        time::sleep(Duration::from_millis(100)).await;
+    }
+
     let mut file = std::fs::File::open(&path)?;
     let mut pos: u64 = 0;
     let mut buf = String::new();
