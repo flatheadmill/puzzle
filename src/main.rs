@@ -4,9 +4,7 @@ mod parser;
 mod render;
 mod tailer;
 
-use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use color_eyre::eyre::{bail, Result};
@@ -82,19 +80,6 @@ fn check_parse(path: &PathBuf) -> Result<()> {
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(format!("{}/code/tmp/puzzle.log", std::env::var("HOME").unwrap()))?;
-    let log_file = Mutex::new(log_file);
-    macro_rules! log {
-        ($($arg:tt)*) => {
-            if let Ok(mut f) = log_file.lock() {
-                let _ = writeln!(f, "{}", format!($($arg)*));
-            }
-        };
-    }
-
     let args: Vec<String> = std::env::args().collect();
 
     let check_mode = args.iter().any(|a| a == "--check");
@@ -121,9 +106,7 @@ async fn main() -> Result<()> {
     // in REPL mode, derive the JSONL path from the session ID and cwd
     let path = if repl_mode {
         let sid = session_id.as_ref().unwrap();
-        let p = session_jsonl_path(sid)?;
-        log!("repl mode: session={}, jsonl={}", sid, p.display());
-        Some(p)
+        Some(session_jsonl_path(sid)?)
     } else {
         path_arg.map(|p| PathBuf::from(p))
     };
@@ -141,7 +124,6 @@ async fn main() -> Result<()> {
     // start the tailer — in REPL mode the file may not exist yet,
     // but the tailer polls until it appears
     let tailer_path = path.clone().unwrap();
-    log!("starting tailer on {}", tailer_path.display());
     let (tx, mut rx) = mpsc::channel(256);
     let tailer_tx = tx.clone();
     tokio::spawn(async move {
@@ -255,9 +237,8 @@ async fn main() -> Result<()> {
                 app.run_state = RunState::Idle;
                 app.mode = Mode::Input;
                 app.follow = true;
-                match &result {
-                    Ok(()) => log!("claude --print completed ok"),
-                    Err(e) => log!("claude --print error: {}", e),
+                if let Err(e) = result {
+                    eprintln!("claude --print error: {}", e);
                 }
             }
             Some(Ok(event)) = events.next() => {
@@ -269,7 +250,6 @@ async fn main() -> Result<()> {
                             && key.code == KeyCode::Enter
                         {
                             if let Some(prompt) = app.submit_input() {
-                                log!("submitting prompt: {}", &prompt);
                                 app.run_state = RunState::Running;
                                 app.follow = true;
 
