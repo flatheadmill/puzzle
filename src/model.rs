@@ -1,3 +1,13 @@
+// Model layer. Sits between parser.rs (raw JSONL schema) and render.rs
+// (styled output). The parser deserializes the full JSONL format faithfully;
+// this module filters to the main conversation chain and converts to
+// display-ready types.
+//
+// The sidechain filter (is_sidechain) drops Claude's internal branching —
+// entries where the model explored alternatives that were not presented.
+// ContentBlock is deliberately simpler than the parser types: it flattens
+// the structural variations into what the renderer needs.
+
 use crate::parser::{
     AssistantContentBlock, AssistantEntry, Entry, TextBlock, ThinkingBlock, ToolResultBlock,
     ToolResultContent, ToolUseBlock, UserContent, UserContentBlock, UserEntry,
@@ -129,6 +139,11 @@ fn convert_assistant(entry: AssistantEntry) -> Option<ConversationEntry> {
     })
 }
 
+// Extracts the most useful field from each tool type's input for the compact
+// tool_use display. Bash shows the command, Read/Write/Edit show the file path,
+// Glob/Grep show the pattern. Unknown tools fall back to listing their input
+// field names. The goal is a one-line summary that tells you what the tool call
+// is doing without expanding the full input.
 fn summarize_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
     match tool_name {
         "Bash" => input
@@ -176,6 +191,8 @@ fn summarize_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
     }
 }
 
+// Known issue: slices by byte offset, not char boundary. Non-ASCII text in
+// tool input (e.g. a Task prompt with unicode) can panic here. In the puddle.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()

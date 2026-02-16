@@ -1,3 +1,19 @@
+// Puzzle: a TUI for reading Claude Code session transcripts with thinking
+// blocks visible. The core conviction: claude --print does the heavy lifting,
+// Puzzle is just a different renderer for what it produces.
+//
+// Two modes of operation: viewer (tails an existing JSONL transcript) and REPL
+// (orchestrates claude --print and tails the session file it writes to). The
+// event loop is tokio::select! across four sources: a frame timer at 33ms for
+// screen refresh, the tailer channel for new conversation entries, a completion
+// channel for claude --print process exit, and crossterm's EventStream for
+// keyboard input.
+//
+// The rendering pipeline: File Tailer (100ms polling) → Parser (serde, kebab-
+// case tag enum) → Model (filter user/assistant on main chain, summarize tool
+// input) → Renderer (styled Lines per content block) → App (scroll state,
+// follow mode, input) → Terminal (ratatui List widget with Scrollbar).
+
 mod app;
 mod model;
 mod parser;
@@ -278,6 +294,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+// Spawns claude --print as a child process. The prompt is a positional argument.
+// stdout and stdin are nulled — we don't read the stream output, we tail the
+// transcript file that claude --print writes to. stderr is piped for error
+// reporting. The --verbose flag is required alongside --output-format stream-json
+// when using --print (discovered during REPL first contact — without it, the
+// stream-json flag is silently ignored).
 async fn run_claude_print(prompt: &str, session_id: &str) -> Result<(), String> {
     let output = Command::new("claude")
         .arg("--print")

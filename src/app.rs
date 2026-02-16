@@ -1,3 +1,16 @@
+// Application state and input handling. Two modes: Scroll for reading
+// transcripts with vim-style navigation (j/k, G/g, PageUp/PageDown), and
+// Input for the REPL prompt. RunState tracks whether claude --print is in
+// flight — while running, input mode only allows Escape and Ctrl-C.
+//
+// Follow mode auto-scrolls to the bottom when new entries arrive from the
+// tailer. It disables when the user scrolls manually (any j/k/arrow) and
+// re-enables on G or End. This mirrors the behavior of tail -f in a terminal.
+//
+// Known issue: cursor_pos is treated as a character index but String::insert
+// and String::remove use byte offsets. Non-ASCII input can panic. This gets
+// fixed when tui-textarea replaces the hand-rolled input (step 008).
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 

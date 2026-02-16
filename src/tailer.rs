@@ -1,3 +1,16 @@
+// File tailer. Polls the JSONL transcript at 100ms intervals, reads new bytes
+// from the last position, buffers incomplete lines, and sends parsed
+// ConversationEntry values over an mpsc channel. Reads from the beginning of
+// the file on first open so the full conversation history is visible.
+//
+// In REPL mode, the JSONL may not exist yet — claude --print creates it on its
+// first invocation. The tailer polls for the file to appear before opening it.
+//
+// Known issue: if the file shrinks (truncation, rotation, rewrite), the
+// size <= pos check causes the tailer to silently stall and miss all future
+// content. Needs a reset path when the file size drops below the read position.
+// In the puddle.
+
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::Duration;

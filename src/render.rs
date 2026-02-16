@@ -1,3 +1,14 @@
+// Rendering layer. Each content block type has its own function that appends
+// styled Lines to a Vec. The caller (main.rs) wraps these in ListItems for
+// ratatui's List widget. The pattern is: render per block, collect, return.
+//
+// Thinking blocks get word-wrapped because they arrive from the model as
+// continuous text without newlines. The textwrap crate handles word boundaries,
+// following the pattern from twitch-tui's chat renderer. Assistant text and
+// tool results render line-by-line without wrapping — assistant text will gain
+// markdown rendering later (step 006), and tool results are structured output
+// where wrapping would be wrong.
+
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -13,6 +24,10 @@ pub fn render_entry(entry: &ConversationEntry, width: u16) -> Vec<Line<'static>>
                 .iter()
                 .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
 
+            // User entries that consist only of tool results suppress the
+            // "Human" header. These entries follow a tool_use visually, and
+            // adding a header between the tool call and its result breaks
+            // the reading flow.
             if !has_tool_results {
                 lines.push(Line::from(Span::styled(
                     "Human",
@@ -126,6 +141,9 @@ fn render_tool_use(lines: &mut Vec<Line<'static>>, name: &str, summary: &str) {
     }
 }
 
+// Tool results show a header with line count and up to eight lines of content.
+// This fixed truncation becomes collapse/expand in step 004: collapsed by
+// default to just the header, expandable on keypress to the full content.
 fn render_tool_result(lines: &mut Vec<Line<'static>>, content: &str, is_error: bool) {
     let style = if is_error {
         Style::default().fg(Color::Red)

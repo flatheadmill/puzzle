@@ -1,10 +1,20 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-// Serde types below parse the full JSONL schema. Many fields and variants are
-// not yet consumed by the model/renderer but exist so deserialization succeeds
-// and the data is available as rendering gets richer. The allow(dead_code)
-// annotations reflect this — they are intentional, not deferred cleanup.
+// Serde types for the Claude Code JSONL transcript format. Built from real
+// session files and the type definitions in the Claude DevTools source
+// (~/code/reference/claude-devtools/src/main/types/jsonl.ts).
+//
+// Deserialization strategy: #[serde(tag = "type")] for externally tagged enums
+// (the JSONL "type" field selects the variant), #[serde(untagged)] for
+// UserContent where the JSONL can be either a bare string or an array of
+// content blocks, and #[serde(other)] as a catch-all so new JSONL types
+// don't break parsing — they just become Unknown and get filtered out.
+//
+// Many fields and variants are not yet consumed by the model/renderer but
+// exist so deserialization succeeds and the data is available as rendering
+// gets richer. The allow(dead_code) annotations reflect this — they are
+// intentional, not deferred cleanup.
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
