@@ -174,6 +174,10 @@ impl App {
         }
     }
 
+    // Toggles all tool results in the selected entry at once. The current
+    // selection model is entry-level (ListState), so there is no way to target
+    // an individual tool result within a multi-result entry. Per-block toggling
+    // would require sub-entry selection, a larger change for later.
     fn toggle_tool_results(&mut self) {
         if let Some(idx) = self.list_state.selected() {
             if let Some(entry) = self.entries.get_mut(idx) {

@@ -4,10 +4,10 @@
 //
 // Thinking blocks get word-wrapped because they arrive from the model as
 // continuous text without newlines. The textwrap crate handles word boundaries,
-// following the pattern from twitch-tui's chat renderer. Assistant text and
-// tool results render line-by-line without wrapping — assistant text will gain
-// markdown rendering later (step 008), and tool results are structured output
-// where wrapping would be wrong.
+// following the pattern from twitch-tui's chat renderer. Tool results collapse
+// by default to a header line with the line count, expandable via Enter on the
+// selected entry. Assistant text renders line-by-line without wrapping or
+// styling for now — markdown rendering (step 008) will change that.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
