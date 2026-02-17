@@ -12,7 +12,9 @@
 // The rendering pipeline: File Tailer (100ms polling) → Parser (serde, kebab-
 // case tag enum) → Model (filter user/assistant on main chain, summarize tool
 // input) → Renderer (styled Lines per content block) → App (scroll state,
-// follow mode, input) → Terminal (ratatui List widget with Scrollbar).
+// follow mode, input) → Terminal (ratatui List widget with Scrollbar). The
+// input area is separate from this pipeline — it is a tui-textarea widget that
+// renders itself into its own Rect and manages its own cursor.
 //
 // Logging goes to /tmp/puzzle.log via tracing with a non-blocking file writer.
 // RUST_LOG controls the filter; defaults to puzzle=debug. The subscriber is
