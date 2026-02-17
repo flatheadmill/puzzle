@@ -2,18 +2,32 @@
 // styled Lines to a Vec. The caller (main.rs) wraps these in ListItems for
 // ratatui's List widget. The pattern is: render per block, collect, return.
 //
-// Thinking blocks get word-wrapped because they arrive from the model as
-// continuous text without newlines. The textwrap crate handles word boundaries,
-// following the pattern from twitch-tui's chat renderer. Tool results collapse
-// by default to a header line with the line count, expandable via Enter on the
-// selected entry. Assistant text renders line-by-line without wrapping or
-// styling for now — markdown rendering (step 008) will change that.
+// Thinking blocks get word-wrapped with textwrap because they arrive from the
+// model as continuous text without newlines. Tool results collapse by default
+// to a header line with the line count, expandable via Enter on the selected
+// entry. Assistant text is parsed as markdown via pulldown-cmark and rendered
+// with styled headings, emphasis, strong, inline code, and code blocks. User
+// text stays as-is (white, no markdown parsing). The markdown walker (MdWriter)
+// maintains an inline style stack so nested formatting composes correctly —
+// bold inside italic gets both modifiers via ratatui's Style::patch. The
+// pattern is modeled on steer's TextWriter but stripped down: no theme system,
+// no syntax highlighting, no tables.
 
 use ansi_to_tui::IntoText;
+use pulldown_cmark::{Event, Parser, Tag};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::model::{ContentBlock, ConversationEntry, EntryKind};
+
+// Markdown styles for assistant text. Simple first-pass palette — headings get
+// color and bold, emphasis and strong use standard terminal modifiers, code uses
+// a distinct color to stand out from surrounding prose.
+const MD_HEADING: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+const MD_EMPHASIS: Style = Style::new().add_modifier(Modifier::ITALIC);
+const MD_STRONG: Style = Style::new().add_modifier(Modifier::BOLD);
+const MD_CODE_INLINE: Style = Style::new().fg(Color::Green);
+const MD_CODE_BLOCK: Style = Style::new().fg(Color::White);
 
 pub fn render_entry(entry: &ConversationEntry, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -56,7 +70,7 @@ pub fn render_entry(entry: &ConversationEntry, width: u16) -> Vec<Line<'static>>
                 render_thinking(&mut lines, text, width);
             }
             ContentBlock::Text { text } => {
-                render_text(&mut lines, text, &entry.kind);
+                render_text(&mut lines, text, &entry.kind, width);
             }
             ContentBlock::ToolUse {
                 name,
@@ -104,15 +118,191 @@ fn render_thinking(lines: &mut Vec<Line<'static>>, text: &str, width: u16) {
     lines.push(Line::from(Span::styled("  \u{2502}", marker_style)));
 }
 
-fn render_text(lines: &mut Vec<Line<'static>>, text: &str, kind: &EntryKind) {
-    let style = match kind {
-        EntryKind::User => Style::default().fg(Color::White),
-        EntryKind::Assistant => Style::default(),
-    };
-
-    for line in text.lines() {
-        lines.push(Line::from(Span::styled(line.to_string(), style)));
+fn render_text(lines: &mut Vec<Line<'static>>, text: &str, kind: &EntryKind, width: u16) {
+    match kind {
+        EntryKind::User => {
+            let style = Style::default().fg(Color::White);
+            for line in text.lines() {
+                lines.push(Line::from(Span::styled(line.to_string(), style)));
+            }
+        }
+        EntryKind::Assistant => {
+            lines.extend(render_markdown(text, width));
+        }
     }
+}
+
+// Walks pulldown-cmark events and produces styled ratatui Lines. Maintains an
+// inline style stack so nested styles compose (bold inside italic gets both via
+// patch). Code blocks set a flag that changes text handling to preserve
+// whitespace. The needs_newline flag tracks paragraph separation so blank lines
+// appear between blocks but not at the start.
+struct MdWriter {
+    lines: Vec<Line<'static>>,
+    inline_styles: Vec<Style>,
+    in_code_block: bool,
+    needs_newline: bool,
+}
+
+impl MdWriter {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            inline_styles: Vec::new(),
+            in_code_block: false,
+            needs_newline: false,
+        }
+    }
+
+    fn push_line(&mut self, line: Line<'static>) {
+        self.lines.push(line);
+    }
+
+    fn push_span(&mut self, span: Span<'static>) {
+        if let Some(last) = self.lines.last_mut() {
+            last.spans.push(span);
+        } else {
+            self.lines.push(Line::from(vec![span]));
+        }
+    }
+
+    fn current_style(&self) -> Style {
+        self.inline_styles.last().copied().unwrap_or_default()
+    }
+
+    fn push_style(&mut self, style: Style) {
+        let composed = self.current_style().patch(style);
+        self.inline_styles.push(composed);
+    }
+
+    fn pop_style(&mut self) {
+        self.inline_styles.pop();
+    }
+
+    fn handle_event(&mut self, event: Event<'_>) {
+        match event {
+            Event::Start(tag) => self.start_tag(tag),
+            Event::End(tag) => self.end_tag(tag),
+            Event::Text(text) => self.text(text.as_ref()),
+            Event::Code(code) => self.code(code.as_ref()),
+            Event::SoftBreak => self.soft_break(),
+            Event::HardBreak => self.hard_break(),
+            Event::Rule => self.rule(),
+            Event::Html(html) => self.text(html.as_ref()),
+            Event::FootnoteReference(r) => self.text(r.as_ref()),
+            Event::TaskListMarker(_) => {}
+        }
+    }
+
+    fn start_tag(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph => {
+                if self.needs_newline {
+                    self.push_line(Line::default());
+                }
+                self.push_line(Line::default());
+                self.needs_newline = false;
+            }
+            Tag::Heading(level, _, _) => {
+                if self.needs_newline {
+                    self.push_line(Line::default());
+                }
+                self.push_style(MD_HEADING);
+                let prefix = format!("{} ", "#".repeat(level as usize));
+                self.push_line(Line::from(Span::styled(prefix, MD_HEADING)));
+                self.needs_newline = false;
+            }
+            Tag::CodeBlock(_) => {
+                if self.needs_newline {
+                    self.push_line(Line::default());
+                }
+                self.in_code_block = true;
+                self.needs_newline = false;
+            }
+            Tag::Emphasis => self.push_style(MD_EMPHASIS),
+            Tag::Strong => self.push_style(MD_STRONG),
+            Tag::BlockQuote | Tag::List(_) => {
+                if self.needs_newline {
+                    self.push_line(Line::default());
+                }
+                self.needs_newline = false;
+            }
+            Tag::Item => {
+                self.push_line(Line::default());
+                self.needs_newline = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn end_tag(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph | Tag::CodeBlock(_) | Tag::BlockQuote | Tag::List(_) => {
+                if matches!(tag, Tag::CodeBlock(_)) {
+                    self.in_code_block = false;
+                }
+                self.needs_newline = true;
+            }
+            Tag::Heading(..) => {
+                self.pop_style();
+                self.needs_newline = true;
+            }
+            Tag::Emphasis | Tag::Strong => self.pop_style(),
+            _ => {}
+        }
+    }
+
+    fn text(&mut self, text: &str) {
+        if self.in_code_block {
+            let text_lines: Vec<&str> = text.lines().collect();
+            for (idx, line) in text_lines.iter().enumerate() {
+                if idx > 0 || self.needs_newline {
+                    self.push_line(Line::default());
+                }
+                self.push_span(Span::styled(line.to_string(), MD_CODE_BLOCK));
+            }
+            self.needs_newline = text.ends_with('\n') && !text_lines.is_empty();
+        } else {
+            if self.needs_newline {
+                self.push_line(Line::default());
+                self.needs_newline = false;
+            }
+            let style = self.current_style();
+            self.push_span(Span::styled(text.to_string(), style));
+        }
+    }
+
+    fn code(&mut self, code: &str) {
+        self.push_span(Span::styled(code.to_string(), MD_CODE_INLINE));
+    }
+
+    fn soft_break(&mut self) {
+        self.push_line(Line::default());
+    }
+
+    fn hard_break(&mut self) {
+        self.push_line(Line::default());
+    }
+
+    fn rule(&mut self) {
+        if self.needs_newline {
+            self.push_line(Line::default());
+        }
+        self.push_line(Line::from(Span::styled(
+            "───",
+            Style::default().fg(Color::DarkGray),
+        )));
+        self.needs_newline = true;
+    }
+}
+
+fn render_markdown(text: &str, _width: u16) -> Vec<Line<'static>> {
+    let parser = Parser::new(text);
+    let mut writer = MdWriter::new();
+    for event in parser {
+        writer.handle_event(event);
+    }
+    writer.lines
 }
 
 fn render_tool_use(lines: &mut Vec<Line<'static>>, name: &str, summary: &str) {
