@@ -200,7 +200,7 @@ pub fn parse_line(line: &str) -> Option<Entry> {
     match serde_json::from_str::<Entry>(line) {
         Ok(entry) => Some(entry),
         Err(e) => {
-            eprintln!("parse error: {}", e);
+            tracing::warn!("parse error: {}", e);
             None
         }
     }

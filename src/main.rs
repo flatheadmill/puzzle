@@ -13,6 +13,10 @@
 // case tag enum) → Model (filter user/assistant on main chain, summarize tool
 // input) → Renderer (styled Lines per content block) → App (scroll state,
 // follow mode, input) → Terminal (ratatui List widget with Scrollbar).
+//
+// Logging goes to /tmp/puzzle.log via tracing with a non-blocking file writer.
+// RUST_LOG controls the filter; defaults to puzzle=debug. The subscriber is
+// initialized before the TUI so early errors are captured.
 
 mod app;
 mod model;
@@ -34,6 +38,8 @@ use ratatui::widgets::{
 };
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::EnvFilter;
 
 use crate::app::{App, Mode, RunState};
 use crate::model::{try_convert, ContentBlock, EntryKind};
@@ -92,8 +98,34 @@ fn check_parse(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+// Initialize tracing with a non-blocking file writer so log output goes to
+// /tmp/puzzle.log instead of fighting the TUI on stdout/stderr. The guard
+// must be held for the program's lifetime to ensure the writer flushes.
+fn init_tracing() -> WorkerGuard {
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/puzzle.log")
+        .expect("failed to open /tmp/puzzle.log");
+
+    let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
+
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("puzzle=debug"));
+
+    tracing_subscriber::fmt()
+        .with_writer(non_blocking)
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_ansi(false)
+        .init();
+
+    guard
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _guard = init_tracing();
     color_eyre::install()?;
 
     let args: Vec<String> = std::env::args().collect();
@@ -144,7 +176,7 @@ async fn main() -> Result<()> {
     let tailer_tx = tx.clone();
     tokio::spawn(async move {
         if let Err(e) = run_tailer(tailer_path, tailer_tx).await {
-            eprintln!("tailer error: {}", e);
+            tracing::error!("tailer error: {}", e);
         }
     });
 
@@ -254,7 +286,7 @@ async fn main() -> Result<()> {
                 app.mode = Mode::Input;
                 app.follow = true;
                 if let Err(e) = result {
-                    eprintln!("claude --print error: {}", e);
+                    tracing::error!("claude --print error: {}", e);
                 }
             }
             Some(Ok(event)) = events.next() => {
