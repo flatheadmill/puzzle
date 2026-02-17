@@ -9,6 +9,7 @@
 // selected entry. Assistant text renders line-by-line without wrapping or
 // styling for now — markdown rendering (step 008) will change that.
 
+use ansi_to_tui::IntoText;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -145,28 +146,51 @@ fn render_tool_use(lines: &mut Vec<Line<'static>>, name: &str, summary: &str) {
 // count. Pressing Enter on the selected entry expands all tool results in it
 // to show full content. The header uses the line count as context — the reader
 // knows what they would get by expanding.
+//
+// When expanded, ANSI escape codes in tool output (colored grep results, styled
+// command output) are parsed via ansi-to-tui into styled ratatui lines. If the
+// content has no ANSI codes, the crate produces unstyled text, same as before.
+// Error results keep the red style regardless of ANSI content.
 fn render_tool_result(lines: &mut Vec<Line<'static>>, content: &str, is_error: bool, collapsed: bool) {
-    let style = if is_error {
-        Style::default().fg(Color::Red)
+    let error_style = Style::default().fg(Color::Red);
+    let header_style = if is_error {
+        error_style
     } else {
         Style::default().fg(Color::DarkGray)
     };
 
-    let result_lines: Vec<&str> = content.lines().collect();
-    let total = result_lines.len();
+    let total = content.lines().count();
 
     let label = if is_error { "error" } else { "result" };
     lines.push(Line::from(Span::styled(
         format!("  \u{25c0} {} ({} lines)", label, total),
-        style,
+        header_style,
     )));
 
     if !collapsed {
-        for line in &result_lines {
-            lines.push(Line::from(Span::styled(
-                format!("    {}", line),
-                style,
-            )));
+        if is_error {
+            for line in content.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", line),
+                    error_style,
+                )));
+            }
+        } else if let Ok(text) = content.as_bytes().into_text() {
+            for line in text.lines {
+                let mut prefixed: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
+                prefixed.push(Span::raw("    "));
+                prefixed.extend(line.spans.into_iter().map(|s| {
+                    Span::styled(s.content.into_owned(), s.style)
+                }));
+                lines.push(Line::from(prefixed));
+            }
+        } else {
+            for line in content.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", line),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
         }
     }
 }
