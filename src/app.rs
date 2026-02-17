@@ -3,16 +3,21 @@
 // Input for the REPL prompt. RunState tracks whether claude --print is in
 // flight — while running, input mode only allows Escape and Ctrl-C.
 //
+// Input uses tui-textarea, which handles cursor movement, word boundaries,
+// selection, clipboard paste, and unicode correctly. The app intercepts
+// Escape and Ctrl-C before delegating to the textarea, and Enter is handled
+// by the event loop in main.rs to trigger submission. The textarea renders
+// itself as a ratatui widget — the app configures it on construction and
+// styles it dynamically in the draw closure based on mode and run state.
+//
 // Follow mode auto-scrolls to the bottom when new entries arrive from the
 // tailer. It disables when the user scrolls manually (any j/k/arrow) and
 // re-enables on G or End. This mirrors the behavior of tail -f in a terminal.
-//
-// Known issue: cursor_pos is treated as a character index but String::insert
-// and String::remove use byte offsets. Non-ASCII input can panic. This gets
-// fixed when tui-textarea replaces the hand-rolled input (step 007).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::ListState;
+use tui_textarea::{Input, TextArea};
 
 use crate::model::{ContentBlock, ConversationEntry};
 
@@ -35,9 +40,15 @@ pub struct App {
     pub should_quit: bool,
     pub mode: Mode,
     pub run_state: RunState,
-    pub input: String,
-    pub cursor_pos: usize,
+    pub textarea: TextArea<'static>,
     pub repl_mode: bool,
+}
+
+fn new_textarea() -> TextArea<'static> {
+    let mut textarea = TextArea::default();
+    textarea.set_cursor_line_style(Style::default());
+    textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    textarea
 }
 
 impl App {
@@ -51,8 +62,7 @@ impl App {
             should_quit: false,
             mode: if repl_mode { Mode::Input } else { Mode::Scroll },
             run_state: RunState::Idle,
-            input: String::new(),
-            cursor_pos: 0,
+            textarea: new_textarea(),
             repl_mode,
         }
     }
@@ -65,13 +75,12 @@ impl App {
     }
 
     pub fn submit_input(&mut self) -> Option<String> {
-        if self.input.trim().is_empty() {
+        let content = self.textarea.lines().join("\n");
+        if content.trim().is_empty() {
             return None;
         }
-        let prompt = self.input.clone();
-        self.input.clear();
-        self.cursor_pos = 0;
-        Some(prompt)
+        self.textarea = new_textarea();
+        Some(content)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
@@ -81,56 +90,24 @@ impl App {
         }
     }
 
+    // In input mode, Escape and Ctrl-C are intercepted before reaching the
+    // textarea. Everything else delegates to tui-textarea via Input::from,
+    // which handles cursor movement, word boundaries, selection, clipboard,
+    // backspace, delete, home, end — all the things the hand-rolled handler
+    // used to do character by character.
     fn handle_input_key(&mut self, key: KeyEvent) {
-        if self.run_state == RunState::Running {
-            // only allow escape and ctrl-c while running
-            match key.code {
-                KeyCode::Esc => self.mode = Mode::Scroll,
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.should_quit = true
-                }
-                _ => {}
-            }
-            return;
-        }
-
         match key.code {
-            KeyCode::Esc => self.mode = Mode::Scroll,
+            KeyCode::Esc => {
+                self.mode = Mode::Scroll;
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true
+                self.should_quit = true;
             }
-            KeyCode::Enter => {
-                // submit is handled by the caller checking submit_input
-                // we just signal by leaving the input as-is
-            }
-            KeyCode::Char(c) => {
-                self.input.insert(self.cursor_pos, c);
-                self.cursor_pos += 1;
-            }
-            KeyCode::Backspace => {
-                if self.cursor_pos > 0 {
-                    self.cursor_pos -= 1;
-                    self.input.remove(self.cursor_pos);
+            _ => {
+                if self.run_state != RunState::Running {
+                    self.textarea.input(Input::from(key));
                 }
             }
-            KeyCode::Delete => {
-                if self.cursor_pos < self.input.len() {
-                    self.input.remove(self.cursor_pos);
-                }
-            }
-            KeyCode::Left => {
-                self.cursor_pos = self.cursor_pos.saturating_sub(1);
-            }
-            KeyCode::Right => {
-                self.cursor_pos = (self.cursor_pos + 1).min(self.input.len());
-            }
-            KeyCode::Home => {
-                self.cursor_pos = 0;
-            }
-            KeyCode::End => {
-                self.cursor_pos = self.input.len();
-            }
-            _ => {}
         }
     }
 

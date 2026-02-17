@@ -32,9 +32,9 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use futures::StreamExt;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::Text;
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, Borders, List, ListItem, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -235,46 +235,37 @@ async fn main() -> Result<()> {
                         .position(app.list_state.selected().unwrap_or(0));
                     frame.render_stateful_widget(scrollbar, conv_chunks[1], &mut scrollbar_state);
 
-                    // prompt input area
+                    // prompt input area — tui-textarea renders itself as a
+                    // widget and manages its own cursor. The block and style
+                    // are set dynamically each frame based on mode and run state.
                     if let Some(input_rect) = input_area {
-                        let (title, style) = match (&app.mode, &app.run_state) {
-                            (_, RunState::Running) => (
-                                " running... ",
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                            (Mode::Input, RunState::Idle) => (
-                                " prompt (esc: scroll) ",
-                                Style::default().fg(Color::White),
-                            ),
-                            (Mode::Scroll, RunState::Idle) => (
-                                " scroll (i: input) ",
-                                Style::default().fg(Color::DarkGray),
-                            ),
+                        let title = match (&app.mode, &app.run_state) {
+                            (_, RunState::Running) => " running... ",
+                            (Mode::Input, RunState::Idle) => " prompt (esc: scroll) ",
+                            (Mode::Scroll, RunState::Idle) => " scroll (i: input) ",
+                        };
+
+                        let border_style = if app.mode == Mode::Input && app.run_state == RunState::Idle {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        };
+
+                        let text_style = match (&app.mode, &app.run_state) {
+                            (_, RunState::Running) => Style::default().fg(Color::DarkGray),
+                            (Mode::Input, RunState::Idle) => Style::default().fg(Color::White),
+                            (Mode::Scroll, RunState::Idle) => Style::default().fg(Color::DarkGray),
                         };
 
                         let input_block = Block::default()
                             .borders(Borders::ALL)
                             .title(title)
-                            .border_style(if app.mode == Mode::Input && app.run_state == RunState::Idle {
-                                Style::default().fg(Color::Cyan)
-                            } else {
-                                Style::default().fg(Color::DarkGray)
-                            });
+                            .border_style(border_style);
 
-                        let input_text = Paragraph::new(Line::from(vec![
-                            Span::styled(app.input.clone(), style),
-                        ]))
-                        .block(input_block);
+                        app.textarea.set_block(input_block);
+                        app.textarea.set_style(text_style);
 
-                        frame.render_widget(input_text, input_rect);
-
-                        // show cursor in input mode
-                        if app.mode == Mode::Input && app.run_state == RunState::Idle {
-                            frame.set_cursor_position((
-                                input_rect.x + app.cursor_pos as u16 + 1,
-                                input_rect.y + 1,
-                            ));
-                        }
+                        frame.render_widget(&app.textarea, input_rect);
                     }
                 })?;
             }
