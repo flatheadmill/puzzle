@@ -18,7 +18,7 @@ pub enum ContentBlock {
     Thinking { text: String },
     Text { text: String },
     ToolUse { name: String, input_summary: String },
-    ToolResult { content: String, is_error: bool },
+    ToolResult { content: String, is_error: bool, collapsed: bool },
 }
 
 #[derive(Debug)]
@@ -71,6 +71,7 @@ fn convert_user(entry: UserEntry) -> Option<ConversationEntry> {
                         blocks.push(ContentBlock::ToolResult {
                             content: text,
                             is_error,
+                            collapsed: true,
                         });
                     }
                     UserContentBlock::Text(TextBlock { text }) => {
@@ -191,12 +192,15 @@ fn summarize_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
     }
 }
 
-// Known issue: slices by byte offset, not char boundary. Non-ASCII text in
-// tool input (e.g. a Task prompt with unicode) can panic here. In the puddle.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        let boundary = s.char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= max)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &s[..boundary])
     }
 }

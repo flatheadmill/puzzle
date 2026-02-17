@@ -9,12 +9,12 @@
 //
 // Known issue: cursor_pos is treated as a character index but String::insert
 // and String::remove use byte offsets. Non-ASCII input can panic. This gets
-// fixed when tui-textarea replaces the hand-rolled input (step 008).
+// fixed when tui-textarea replaces the hand-rolled input (step 007).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
 
-use crate::model::ConversationEntry;
+use crate::model::{ContentBlock, ConversationEntry};
 
 #[derive(PartialEq)]
 pub enum Mode {
@@ -143,6 +143,9 @@ impl App {
             KeyCode::Char('i') if self.repl_mode => {
                 self.mode = Mode::Input;
             }
+            KeyCode::Enter => {
+                self.toggle_tool_results();
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.scroll_down(1);
                 self.follow = false;
@@ -168,6 +171,18 @@ impl App {
                 self.follow = false;
             }
             _ => {}
+        }
+    }
+
+    fn toggle_tool_results(&mut self) {
+        if let Some(idx) = self.list_state.selected() {
+            if let Some(entry) = self.entries.get_mut(idx) {
+                for block in &mut entry.blocks {
+                    if let ContentBlock::ToolResult { collapsed, .. } = block {
+                        *collapsed = !*collapsed;
+                    }
+                }
+            }
         }
     }
 

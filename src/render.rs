@@ -6,7 +6,7 @@
 // continuous text without newlines. The textwrap crate handles word boundaries,
 // following the pattern from twitch-tui's chat renderer. Assistant text and
 // tool results render line-by-line without wrapping — assistant text will gain
-// markdown rendering later (step 006), and tool results are structured output
+// markdown rendering later (step 008), and tool results are structured output
 // where wrapping would be wrong.
 
 use ratatui::style::{Color, Modifier, Style};
@@ -63,8 +63,8 @@ pub fn render_entry(entry: &ConversationEntry, width: u16) -> Vec<Line<'static>>
             } => {
                 render_tool_use(&mut lines, name, input_summary);
             }
-            ContentBlock::ToolResult { content, is_error } => {
-                render_tool_result(&mut lines, content, *is_error);
+            ContentBlock::ToolResult { content, is_error, collapsed } => {
+                render_tool_result(&mut lines, content, *is_error, *collapsed);
             }
         }
     }
@@ -141,10 +141,11 @@ fn render_tool_use(lines: &mut Vec<Line<'static>>, name: &str, summary: &str) {
     }
 }
 
-// Tool results show a header with line count and up to eight lines of content.
-// This fixed truncation becomes collapse/expand in step 004: collapsed by
-// default to just the header, expandable on keypress to the full content.
-fn render_tool_result(lines: &mut Vec<Line<'static>>, content: &str, is_error: bool) {
+// Tool results collapse by default to a single header line showing the line
+// count. Pressing Enter on the selected entry expands all tool results in it
+// to show full content. The header uses the line count as context — the reader
+// knows what they would get by expanding.
+fn render_tool_result(lines: &mut Vec<Line<'static>>, content: &str, is_error: bool, collapsed: bool) {
     let style = if is_error {
         Style::default().fg(Color::Red)
     } else {
@@ -160,17 +161,12 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, content: &str, is_error: b
         style,
     )));
 
-    for line in result_lines.iter().take(8) {
-        lines.push(Line::from(Span::styled(
-            format!("    {}", line),
-            style,
-        )));
-    }
-
-    if total > 8 {
-        lines.push(Line::from(Span::styled(
-            format!("    ... ({} more lines)", total - 8),
-            style,
-        )));
+    if !collapsed {
+        for line in &result_lines {
+            lines.push(Line::from(Span::styled(
+                format!("    {}", line),
+                style,
+            )));
+        }
     }
 }
