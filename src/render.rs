@@ -6,7 +6,8 @@
 // model as continuous text without newlines. Tool results collapse by default
 // to a header line with the line count, expandable via Enter on the selected
 // entry. Assistant text is parsed as markdown via pulldown-cmark and rendered
-// with styled headings, emphasis, strong, inline code, and code blocks. User
+// with styled headings, emphasis, strong, inline code, code blocks, and lists
+// with depth-based indentation and bullet/numbered markers. User
 // text stays as-is (white, no markdown parsing). The markdown walker (MdWriter)
 // maintains an inline style stack so nested formatting composes correctly —
 // bold inside italic gets both modifiers via ratatui's Style::patch. The
@@ -134,13 +135,17 @@ fn render_text(lines: &mut Vec<Line<'static>>, text: &str, kind: &EntryKind, wid
 
 // Walks pulldown-cmark events and produces styled ratatui Lines. Maintains an
 // inline style stack so nested styles compose (bold inside italic gets both via
-// patch). Code blocks set a flag that changes text handling to preserve
-// whitespace. The needs_newline flag tracks paragraph separation so blank lines
-// appear between blocks but not at the start.
+// patch), and a list index stack that drives marker rendering (None for bullet
+// lists, Some(n) for numbered). Code blocks set a flag that changes text
+// handling to preserve whitespace. The needs_newline flag tracks paragraph
+// separation. List markers are deferred until the first content event in each
+// item so they land on the same line as the text.
 struct MdWriter {
     lines: Vec<Line<'static>>,
     inline_styles: Vec<Style>,
+    list_indices: Vec<Option<u64>>,
     in_code_block: bool,
+    in_list_item_start: bool,
     needs_newline: bool,
 }
 
@@ -149,7 +154,9 @@ impl MdWriter {
         Self {
             lines: Vec::new(),
             inline_styles: Vec::new(),
+            list_indices: Vec::new(),
             in_code_block: false,
+            in_list_item_start: false,
             needs_newline: false,
         }
     }
@@ -179,6 +186,26 @@ impl MdWriter {
         self.inline_styles.pop();
     }
 
+    fn push_list_marker(&mut self) {
+        if self.list_indices.is_empty() {
+            return;
+        }
+        let depth = self.list_indices.len();
+        let indent = depth.saturating_sub(1) * 4;
+        let indent_str = " ".repeat(indent);
+
+        if let Some(idx) = self.list_indices.last_mut() {
+            let marker = match idx {
+                None => format!("{}- ", indent_str),
+                Some(n) => {
+                    *n += 1;
+                    format!("{}{}. ", indent_str, *n - 1)
+                }
+            };
+            self.push_span(Span::raw(marker));
+        }
+    }
+
     fn handle_event(&mut self, event: Event<'_>) {
         match event {
             Event::Start(tag) => self.start_tag(tag),
@@ -200,7 +227,11 @@ impl MdWriter {
                 if self.needs_newline {
                     self.push_line(Line::default());
                 }
-                self.push_line(Line::default());
+                // Inside list items, Start(Item) already pushed the content
+                // line. Adding another would leave an orphan blank line.
+                if self.list_indices.is_empty() {
+                    self.push_line(Line::default());
+                }
                 self.needs_newline = false;
             }
             Tag::Heading(level, _, _) => {
@@ -219,16 +250,36 @@ impl MdWriter {
                 self.in_code_block = true;
                 self.needs_newline = false;
             }
-            Tag::Emphasis => self.push_style(MD_EMPHASIS),
-            Tag::Strong => self.push_style(MD_STRONG),
-            Tag::BlockQuote | Tag::List(_) => {
+            Tag::Emphasis => {
+                if self.in_list_item_start {
+                    self.push_list_marker();
+                    self.in_list_item_start = false;
+                }
+                self.push_style(MD_EMPHASIS);
+            }
+            Tag::Strong => {
+                if self.in_list_item_start {
+                    self.push_list_marker();
+                    self.in_list_item_start = false;
+                }
+                self.push_style(MD_STRONG);
+            }
+            Tag::BlockQuote => {
                 if self.needs_newline {
                     self.push_line(Line::default());
                 }
                 self.needs_newline = false;
             }
+            Tag::List(start_index) => {
+                if self.list_indices.is_empty() && self.needs_newline {
+                    self.push_line(Line::default());
+                }
+                self.list_indices.push(start_index);
+                self.needs_newline = false;
+            }
             Tag::Item => {
                 self.push_line(Line::default());
+                self.in_list_item_start = true;
                 self.needs_newline = false;
             }
             _ => {}
@@ -237,7 +288,7 @@ impl MdWriter {
 
     fn end_tag(&mut self, tag: Tag<'_>) {
         match tag {
-            Tag::Paragraph | Tag::CodeBlock(_) | Tag::BlockQuote | Tag::List(_) => {
+            Tag::Paragraph | Tag::CodeBlock(_) | Tag::BlockQuote => {
                 if matches!(tag, Tag::CodeBlock(_)) {
                     self.in_code_block = false;
                 }
@@ -248,11 +299,25 @@ impl MdWriter {
                 self.needs_newline = true;
             }
             Tag::Emphasis | Tag::Strong => self.pop_style(),
+            Tag::List(_) => {
+                self.list_indices.pop();
+                self.needs_newline = true;
+            }
+            Tag::Item => {
+                if self.in_list_item_start {
+                    self.push_list_marker();
+                    self.in_list_item_start = false;
+                }
+            }
             _ => {}
         }
     }
 
     fn text(&mut self, text: &str) {
+        if self.in_list_item_start {
+            self.push_list_marker();
+            self.in_list_item_start = false;
+        }
         if self.in_code_block {
             let text_lines: Vec<&str> = text.lines().collect();
             for (idx, line) in text_lines.iter().enumerate() {
@@ -273,6 +338,10 @@ impl MdWriter {
     }
 
     fn code(&mut self, code: &str) {
+        if self.in_list_item_start {
+            self.push_list_marker();
+            self.in_list_item_start = false;
+        }
         self.push_span(Span::styled(code.to_string(), MD_CODE_INLINE));
     }
 
