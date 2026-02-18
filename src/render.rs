@@ -7,17 +7,23 @@
 // to a header line with the line count, expandable via Enter on the selected
 // entry. Assistant text is parsed as markdown via pulldown-cmark and rendered
 // with styled headings, emphasis, strong, inline code, code blocks, and lists
-// with depth-based indentation and bullet/numbered markers. User
-// text stays as-is (white, no markdown parsing). The markdown walker (MdWriter)
-// maintains an inline style stack so nested formatting composes correctly —
-// bold inside italic gets both modifiers via ratatui's Style::patch. The
-// pattern is modeled on steer's TextWriter but stripped down: no theme system,
-// no syntax highlighting, no tables.
+// with depth-based indentation and bullet/numbered markers. Long prose lines
+// wrap at terminal width on word boundaries via style_wrap_with_indent, which
+// preserves span styles across breaks and indents continuation lines for list
+// items. Code block lines pass through unwrapped. The markdown walker
+// (MdWriter) produces MarkedLine values — each a styled Line annotated with
+// no_wrap and indent_level — that the wrapping layer consumes. User text
+// stays as-is (white, no markdown parsing). The walker maintains an inline
+// style stack so nested formatting composes correctly — bold inside italic
+// gets both modifiers via ratatui's Style::patch. The pattern is modeled on
+// steer's TextWriter but stripped down: no theme system, no syntax
+// highlighting, no tables.
 
 use ansi_to_tui::IntoText;
 use pulldown_cmark::{Event, Parser, Tag};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use crate::model::{ContentBlock, ConversationEntry, EntryKind};
 
@@ -29,6 +35,17 @@ const MD_EMPHASIS: Style = Style::new().add_modifier(Modifier::ITALIC);
 const MD_STRONG: Style = Style::new().add_modifier(Modifier::BOLD);
 const MD_CODE_INLINE: Style = Style::new().fg(Color::Green);
 const MD_CODE_BLOCK: Style = Style::new().fg(Color::White);
+
+// A styled Line annotated with wrapping metadata. The markdown walker produces
+// these so the wrapping layer knows which lines to wrap and how to indent
+// continuation lines. Code block lines carry no_wrap so they pass through at
+// full width. List item lines carry indent_level equal to the marker width so
+// wrapped continuations align with the text after the marker.
+struct MarkedLine {
+    line: Line<'static>,
+    no_wrap: bool,
+    indent_level: usize,
+}
 
 pub fn render_entry(entry: &ConversationEntry, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -128,22 +145,32 @@ fn render_text(lines: &mut Vec<Line<'static>>, text: &str, kind: &EntryKind, wid
             }
         }
         EntryKind::Assistant => {
-            lines.extend(render_markdown(text, width));
+            for ml in render_markdown(text) {
+                if ml.no_wrap {
+                    lines.push(ml.line);
+                } else {
+                    lines.extend(style_wrap_with_indent(ml.line, width, ml.indent_level));
+                }
+            }
         }
     }
 }
 
-// Walks pulldown-cmark events and produces styled ratatui Lines. Maintains an
-// inline style stack so nested styles compose (bold inside italic gets both via
-// patch), and a list index stack that drives marker rendering (None for bullet
-// lists, Some(n) for numbered). Code blocks set a flag that changes text
-// handling to preserve whitespace. The needs_newline flag tracks paragraph
-// separation. List markers are deferred until the first content event in each
-// item so they land on the same line as the text.
+// Walks pulldown-cmark events and produces MarkedLine values — styled ratatui
+// Lines annotated with wrapping metadata. Maintains an inline style stack so
+// nested styles compose (bold inside italic gets both via patch), a list index
+// stack that drives marker rendering (None for bullet lists, Some(n) for
+// numbered), and an item indent stack that tracks the marker width at each
+// nesting level for continuation line indentation. Code blocks set a flag that
+// changes text handling to preserve whitespace and marks output lines no_wrap.
+// The needs_newline flag tracks paragraph separation. List markers are deferred
+// until the first content event in each item so they land on the same line as
+// the text.
 struct MdWriter {
-    lines: Vec<Line<'static>>,
+    lines: Vec<MarkedLine>,
     inline_styles: Vec<Style>,
     list_indices: Vec<Option<u64>>,
+    item_indents: Vec<usize>,
     in_code_block: bool,
     in_list_item_start: bool,
     needs_newline: bool,
@@ -155,6 +182,7 @@ impl MdWriter {
             lines: Vec::new(),
             inline_styles: Vec::new(),
             list_indices: Vec::new(),
+            item_indents: Vec::new(),
             in_code_block: false,
             in_list_item_start: false,
             needs_newline: false,
@@ -162,14 +190,22 @@ impl MdWriter {
     }
 
     fn push_line(&mut self, line: Line<'static>) {
-        self.lines.push(line);
+        self.lines.push(MarkedLine {
+            line,
+            no_wrap: self.in_code_block,
+            indent_level: self.item_indents.last().copied().unwrap_or(0),
+        });
     }
 
     fn push_span(&mut self, span: Span<'static>) {
         if let Some(last) = self.lines.last_mut() {
-            last.spans.push(span);
+            last.line.spans.push(span);
         } else {
-            self.lines.push(Line::from(vec![span]));
+            self.lines.push(MarkedLine {
+                line: Line::from(vec![span]),
+                no_wrap: self.in_code_block,
+                indent_level: self.item_indents.last().copied().unwrap_or(0),
+            });
         }
     }
 
@@ -202,7 +238,17 @@ impl MdWriter {
                     format!("{}{}. ", indent_str, *n - 1)
                 }
             };
+            // Set the indent level for this item's continuation lines so
+            // wrapped text aligns with the content after the marker.
+            if let Some(item_indent) = self.item_indents.last_mut() {
+                *item_indent = marker.len();
+            }
             self.push_span(Span::raw(marker));
+            // The line was created at Start(Item) before the marker width was
+            // known. Update it now that the marker has been computed.
+            if let Some(last) = self.lines.last_mut() {
+                last.indent_level = self.item_indents.last().copied().unwrap_or(0);
+            }
         }
     }
 
@@ -278,6 +324,7 @@ impl MdWriter {
                 self.needs_newline = false;
             }
             Tag::Item => {
+                self.item_indents.push(0);
                 self.push_line(Line::default());
                 self.in_list_item_start = true;
                 self.needs_newline = false;
@@ -308,6 +355,7 @@ impl MdWriter {
                     self.push_list_marker();
                     self.in_list_item_start = false;
                 }
+                self.item_indents.pop();
             }
             _ => {}
         }
@@ -365,13 +413,69 @@ impl MdWriter {
     }
 }
 
-fn render_markdown(text: &str, _width: u16) -> Vec<Line<'static>> {
+fn render_markdown(text: &str) -> Vec<MarkedLine> {
     let parser = Parser::new(text);
     let mut writer = MdWriter::new();
     for event in parser {
         writer.handle_event(event);
     }
     writer.lines
+}
+
+// Wraps a styled Line at word boundaries while preserving span styles across
+// breaks. Continuation lines are indented by `indent` spaces so list item text
+// aligns after the marker. The approach is from steer's style_wrap_with_indent:
+// walk spans, split on whitespace via split_inclusive, track width with
+// unicode-width. When a word would exceed the effective width, start a new line
+// with the indent prepended.
+fn style_wrap_with_indent(line: Line<'_>, max_width: u16, indent: usize) -> Vec<Line<'static>> {
+    let max_width = max_width as usize;
+    let mut output_lines: Vec<Line<'static>> = Vec::new();
+    let mut current_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_width: usize = 0;
+    let mut is_first_line = true;
+
+    for span in line.spans {
+        let style = span.style;
+        let content = span.content.as_ref();
+
+        for word in content.split_inclusive(' ') {
+            let word_width = word.width();
+
+            let effective_max = if is_first_line {
+                max_width
+            } else {
+                max_width.saturating_sub(indent)
+            };
+
+            if current_width > 0 && current_width + word_width > effective_max {
+                if !current_spans.is_empty() {
+                    output_lines.push(Line::from(current_spans));
+                    current_spans = Vec::new();
+                    current_width = 0;
+                    is_first_line = false;
+
+                    if indent > 0 {
+                        current_spans.push(Span::raw(" ".repeat(indent)));
+                        current_width = indent;
+                    }
+                }
+            }
+
+            current_spans.push(Span::styled(word.to_string(), style));
+            current_width += word_width;
+        }
+    }
+
+    if !current_spans.is_empty() {
+        output_lines.push(Line::from(current_spans));
+    }
+
+    if output_lines.is_empty() {
+        output_lines.push(Line::from(""));
+    }
+
+    output_lines
 }
 
 fn render_tool_use(lines: &mut Vec<Line<'static>>, name: &str, summary: &str) {
