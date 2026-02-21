@@ -88,6 +88,7 @@ use uuid::Uuid;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // fields parsed for completeness; available as rendering gets richer
 pub enum StdoutEvent {
     /// The result event is the per-round completion boundary. When Puzzle sees
     /// this, the round is done. If nothing is queued on Puzzle's side, the
@@ -165,6 +166,7 @@ struct UserMessageContent {
     content: String,
 }
 
+#[allow(dead_code)] // interrupt and keep_alive not yet wired; API surface for mid-turn control
 /// An interrupt request. Cancels the current turn via an abort controller in
 /// the CLI. After the turn unwinds, the executor clears its running flag and
 /// processes the next queued command. Pattern for urgent intervention: send
@@ -184,6 +186,7 @@ struct InterruptSubtype {
 /// Puzzle can send these periodically to keep the pipe active during long
 /// idle periods.
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 struct KeepAlive {
     r#type: &'static str,
 }
@@ -214,6 +217,7 @@ struct KeepAlive {
 /// forks — the CLI reads the file for history, generates a new session ID,
 /// and writes to its own JSONL under ~/.claude/projects/. An empty touched
 /// file works too, producing a fresh session with no history.
+#[allow(dead_code)] // FilePath variant is the fork mechanism; not yet wired in main
 pub enum ResumeTarget {
     /// A session UUID. Resumes the existing session in place.
     SessionId(String),
@@ -222,6 +226,7 @@ pub enum ResumeTarget {
     FilePath(String),
 }
 
+#[allow(dead_code)] // sent/replayed/model not yet read externally; API surface for future use
 pub struct Invocation {
     child: Child,
     stdin: Option<tokio::process::ChildStdin>,
@@ -236,6 +241,7 @@ pub struct Invocation {
 /// channel type — it carries parsed events from the child's stdout.
 pub type EventReceiver = mpsc::Receiver<StdoutEvent>;
 
+#[allow(dead_code)] // interrupt, keep_alive, is_drained, sent, replayed: API surface for future use
 impl Invocation {
     /// Create and spawn a new invocation. Returns the invocation and a channel
     /// receiver for stdout events. The caller (main loop) reads from the

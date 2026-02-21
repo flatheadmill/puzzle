@@ -3,11 +3,18 @@
 // Puzzle is just a different renderer for what it produces.
 //
 // Two modes of operation: viewer (tails an existing JSONL transcript) and REPL
-// (orchestrates claude --print and tails the session file it writes to). The
-// event loop is tokio::select! across four sources: a frame timer at 33ms for
-// screen refresh, the tailer channel for new conversation entries, a completion
-// channel for claude --print process exit, and crossterm's EventStream for
-// keyboard input.
+// (orchestrates claude --print via the Invocation abstraction in claude.rs and
+// tails the session file it writes to). The event loop is tokio::select! across
+// four sources: a frame timer at 33ms for screen refresh, the tailer channel
+// for new conversation entries, the claude stdout event channel for process
+// lifecycle and drain tracking, and crossterm's EventStream for keyboard input.
+//
+// The REPL spawns one Invocation per prompt cycle. The Invocation holds a child
+// process with --input-format stream-json, writes NDJSON to stdin, reads events
+// from stdout. When the round completes (result event, all messages drained),
+// the Invocation shuts down and a new one is spawned for the next prompt. The
+// tailer is independent — it watches the JSONL file on disk, not the process.
+// This means the tailer survives across child process boundaries.
 //
 // The rendering pipeline: File Tailer (100ms polling) → Parser (serde, kebab-
 // case tag enum) → Model (filter user/assistant on main chain, summarize tool
@@ -21,6 +28,7 @@
 // initialized before the TUI so early errors are captured.
 
 mod app;
+mod claude;
 mod model;
 mod parser;
 mod render;
@@ -38,12 +46,12 @@ use ratatui::text::Text;
 use ratatui::widgets::{
     Block, Borders, List, ListItem, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::{App, Mode, RunState};
+use crate::claude::{EventReceiver, Invocation, ResumeTarget, StdoutEvent};
 use crate::model::{try_convert, ContentBlock, EntryKind};
 use crate::parser::parse_line;
 use crate::render::render_entry;
@@ -125,6 +133,16 @@ fn init_tracing() -> WorkerGuard {
     guard
 }
 
+/// Receives the next stdout event from the Claude process, or pends forever
+/// if no invocation is active. Used as a select! arm that effectively disables
+/// itself when there is no child process running.
+async fn recv_claude(rx: &mut Option<EventReceiver>) -> Option<StdoutEvent> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _guard = init_tracing();
@@ -135,8 +153,10 @@ async fn main() -> Result<()> {
     let check_mode = args.iter().any(|a| a == "--check");
     let repl_mode = args.iter().any(|a| a == "--repl");
 
-    // --resume <session-id> for REPL mode
-    let session_id = args.iter().position(|a| a == "--resume")
+    // --resume <session-id> for REPL mode. Mutable because the Invocation may
+    // discover a different session ID (e.g., when resuming from a .jsonl file
+    // path, the CLI forks to a new session with a new UUID).
+    let mut session_id = args.iter().position(|a| a == "--resume")
         .and_then(|i| args.get(i + 1))
         .cloned();
 
@@ -187,8 +207,11 @@ async fn main() -> Result<()> {
     let mut events = EventStream::new();
     let mut frame_interval = tokio::time::interval(Duration::from_millis(33));
 
-    // channel for claude --print process completion
-    let (print_tx, mut print_rx) = mpsc::channel::<Result<(), String>>(1);
+    // The Invocation and its stdout event channel. Both are None when no child
+    // process is running (between prompts, or in viewer-only mode). Spawned on
+    // the first prompt submission, dropped after each round drains.
+    let mut invocation: Option<Invocation> = None;
+    let mut claude_rx: Option<EventReceiver> = None;
 
     loop {
         tokio::select! {
@@ -274,12 +297,44 @@ async fn main() -> Result<()> {
             Some(entry) = rx.recv() => {
                 app.push_entry(entry);
             }
-            Some(result) = print_rx.recv() => {
-                app.run_state = RunState::Idle;
-                app.mode = Mode::Input;
-                app.follow = true;
-                if let Err(e) = result {
-                    tracing::error!("claude --print error: {}", e);
+            event = recv_claude(&mut claude_rx) => {
+                match event {
+                    Some(event) => {
+                        if let Some(ref mut inv) = invocation {
+                            let drained = inv.handle_event(&event);
+                            if drained {
+                                // Capture session ID before dropping the invocation.
+                                // This feeds the next Invocation::spawn() with the
+                                // correct session, including after file path forks
+                                // where the CLI generated a new UUID.
+                                if let Some(sid) = inv.session_id() {
+                                    session_id = Some(sid.to_string());
+                                }
+                                let inv = invocation.take().unwrap();
+                                let _ = inv.shutdown().await;
+                                claude_rx = None;
+                                app.run_state = RunState::Idle;
+                                app.mode = Mode::Input;
+                                app.follow = true;
+                            }
+                        }
+                    }
+                    None => {
+                        // Channel closed — the child process exited or the stdout
+                        // pipe broke. Capture session ID and clean up. shutdown()
+                        // is safe here: if the child already exited, wait() returns
+                        // immediately.
+                        if let Some(inv) = invocation.take() {
+                            if let Some(sid) = inv.session_id() {
+                                session_id = Some(sid.to_string());
+                            }
+                            let _ = inv.shutdown().await;
+                        }
+                        claude_rx = None;
+                        app.run_state = RunState::Idle;
+                        app.mode = Mode::Input;
+                        app.follow = true;
+                    }
                 }
             }
             Some(Ok(event)) = events.next() => {
@@ -291,16 +346,35 @@ async fn main() -> Result<()> {
                             && key.code == KeyCode::Enter
                         {
                             if let Some(prompt) = app.submit_input() {
+                                let sid = session_id.clone().unwrap();
+                                let target = ResumeTarget::SessionId(sid);
+
+                                match Invocation::spawn(target, None) {
+                                    Ok((inv, rx)) => {
+                                        invocation = Some(inv);
+                                        claude_rx = Some(rx);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("failed to spawn claude: {}", e);
+                                        // don't change run_state, stay idle
+                                        continue;
+                                    }
+                                }
+
+                                if let Some(ref mut inv) = invocation {
+                                    if let Err(e) = inv.send(&prompt).await {
+                                        tracing::error!("failed to send prompt: {}", e);
+                                        // clean up the failed invocation
+                                        if let Some(inv) = invocation.take() {
+                                            let _ = inv.shutdown().await;
+                                        }
+                                        claude_rx = None;
+                                        continue;
+                                    }
+                                }
+
                                 app.run_state = RunState::Running;
                                 app.follow = true;
-
-                                let tx = print_tx.clone();
-                                let sid = session_id.clone().unwrap();
-
-                                tokio::spawn(async move {
-                                    let result = run_claude_print(&prompt, &sid).await;
-                                    let _ = tx.send(result).await;
-                                });
                             }
                         } else {
                             app.handle_key(key);
@@ -316,38 +390,6 @@ async fn main() -> Result<()> {
     }
 
     ratatui::restore();
-    Ok(())
-}
-
-// Spawns claude --print as a child process. The prompt is a positional argument.
-// stdout and stdin are nulled — we don't read the stream output, we tail the
-// transcript file that claude --print writes to. stderr is piped for error
-// reporting. The --verbose flag is required alongside --output-format stream-json
-// when using --print (discovered during REPL first contact — without it, the
-// stream-json flag is silently ignored).
-async fn run_claude_print(prompt: &str, session_id: &str) -> Result<(), String> {
-    let output = Command::new("claude")
-        .arg("--print")
-        .arg("--verbose")
-        .arg("--max-thinking-tokens")
-        .arg("31999")
-        .arg("--output-format")
-        .arg("stream-json")
-        .arg("--resume")
-        .arg(session_id)
-        .arg(prompt)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("failed to spawn claude: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("claude --print exited with {}: {}", output.status, stderr));
-    }
-
     Ok(())
 }
 

@@ -19,3 +19,4 @@ tracing-appender = "0.2"
 tui-textarea = "0.7"
 pulldown-cmark = "0.9"
 unicode-width = "0.1"
+uuid = { version = "1", features = ["v4"] }
