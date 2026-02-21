@@ -31,6 +31,7 @@ mod app;
 mod claude;
 mod config;
 mod model;
+mod sessions;
 mod parser;
 mod render;
 mod tailer;
