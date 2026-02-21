@@ -258,6 +258,7 @@ impl Invocation {
     pub fn spawn(
         target: ResumeTarget,
         model: Option<String>,
+        add_dirs: &[String],
     ) -> Result<(Self, EventReceiver), std::io::Error> {
         let resume_arg = match &target {
             ResumeTarget::SessionId(id) => id.clone(),
@@ -275,6 +276,10 @@ impl Invocation {
 
         if let Some(ref m) = model {
             cmd.arg("--model").arg(m);
+        }
+
+        for dir in add_dirs {
+            cmd.arg("--add-dir").arg(dir);
         }
 
         cmd.stdin(Stdio::piped())

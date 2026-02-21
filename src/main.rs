@@ -151,55 +151,117 @@ async fn main() -> Result<()> {
     color_eyre::install()?;
 
     let args: Vec<String> = std::env::args().collect();
-
     let check_mode = args.iter().any(|a| a == "--check");
-    let repl_mode = args.iter().any(|a| a == "--repl");
 
-    // --resume <session-id> for REPL mode. Mutable because the Invocation may
-    // discover a different session ID (e.g., when resuming from a .jsonl file
-    // path, the CLI forks to a new session with a new UUID).
-    let mut session_id = args.iter().position(|a| a == "--resume")
-        .and_then(|i| args.get(i + 1))
+    // First positional arg is either a .jsonl path (viewer) or a slug (REPL).
+    let positional = args.iter().skip(1)
+        .find(|a| !a.starts_with("--"))
         .cloned();
 
-    let path_arg = args
-        .iter()
-        .skip(1)
-        .find(|a| !a.starts_with("--") && session_id.as_ref() != Some(a));
-
-    if repl_mode && session_id.is_none() {
-        bail!("usage: puzzle --repl --resume <session-id>");
-    }
-
-    if path_arg.is_none() && !repl_mode {
-        bail!("usage: puzzle <path-to-session.jsonl>\n       puzzle --repl --resume <session-id>");
-    }
-
-    // in REPL mode, derive the JSONL path from the session ID and cwd
-    let path = if repl_mode {
-        let sid = session_id.as_ref().unwrap();
-        Some(session_jsonl_path(sid)?)
-    } else {
-        path_arg.map(|p| PathBuf::from(p))
+    let positional = match positional {
+        Some(p) => p,
+        None => bail!("usage: puzzle <slug>\n       puzzle <path-to-session.jsonl>"),
     };
 
-    if let Some(ref p) = path {
-        if !p.exists() && !repl_mode {
-            bail!("file not found: {}", p.display());
-        }
-    }
-
     if check_mode {
-        return check_parse(path.as_ref().unwrap());
+        let path = PathBuf::from(&positional);
+        if !path.exists() {
+            bail!("file not found: {}", path.display());
+        }
+        return check_parse(&path);
     }
 
-    // start the tailer — in REPL mode the file may not exist yet,
-    // but the tailer polls until it appears
-    let tailer_path = path.clone().unwrap();
+    let home = std::env::var("HOME")
+        .map_err(|e| color_eyre::eyre::eyre!("HOME not set: {}", e))?;
+
+    let repl_mode = !positional.ends_with(".jsonl");
+    let mut session_id: Option<String> = None;
+    let mut invocation: Option<Invocation> = None;
+    let mut claude_rx: Option<EventReceiver> = None;
+    let add_dirs: Vec<String>;
+    let tailer_path: PathBuf;
+
+    if repl_mode {
+        let slug = &positional;
+
+        // Ensure the pane directory exists.
+        let pane_dir = PathBuf::from(&home).join("pane").join(slug);
+        std::fs::create_dir_all(&pane_dir)?;
+
+        // Ensure trust so the CLI skips the approval dialog.
+        let config_path = PathBuf::from(&home).join(".claude.json");
+        let pane_dir_str = pane_dir.to_str()
+            .ok_or_else(|| color_eyre::eyre::eyre!("pane dir is not valid UTF-8"))?;
+        config::modify_config(&config_path, |c| config::ensure_trust(c, pane_dir_str))
+            .map_err(|e| color_eyre::eyre::eyre!("{}", e))?;
+
+        // Look up the latest session for this slug.
+        let puzzle_config_dir = PathBuf::from(&home).join(".config").join("puzzle");
+
+        // Set working directory to the pane dir so the CLI and
+        // session_jsonl_path both resolve against it.
+        std::env::set_current_dir(&pane_dir)?;
+
+        add_dirs = vec![format!("{}/code", home)];
+
+        match sessions::latest_session(&puzzle_config_dir, slug) {
+            Some(sid) => {
+                // Existing session — record optimistically, derive JSONL path.
+                sessions::record_session(&puzzle_config_dir, slug, &sid)?;
+                tailer_path = session_jsonl_path(&sid)?;
+                session_id = Some(sid);
+            }
+            None => {
+                // Bootstrap — fork from an empty touched file to get a new session.
+                let temp_path = std::env::temp_dir()
+                    .join(format!("puzzle-bootstrap-{}.jsonl", slug));
+                std::fs::write(&temp_path, "")?;
+
+                let (mut inv, mut inv_rx) = Invocation::spawn(
+                    ResumeTarget::FilePath(temp_path.to_string_lossy().to_string()),
+                    None,
+                    &add_dirs,
+                )?;
+
+                // Read stdout events until the session ID appears. The CLI
+                // emits it in the first event (system hook_started).
+                let mut captured_sid = None;
+                while let Some(event) = inv_rx.recv().await {
+                    inv.handle_event(&event);
+                    if let Some(sid) = inv.session_id() {
+                        captured_sid = Some(sid.to_string());
+                        break;
+                    }
+                }
+
+                let sid = captured_sid.ok_or_else(|| {
+                    color_eyre::eyre::eyre!("bootstrap: CLI exited without emitting a session ID")
+                })?;
+
+                sessions::record_session(&puzzle_config_dir, slug, &sid)?;
+                let _ = std::fs::remove_file(&temp_path);
+
+                tailer_path = session_jsonl_path(&sid)?;
+                session_id = Some(sid);
+                invocation = Some(inv);
+                claude_rx = Some(inv_rx);
+            }
+        }
+    } else {
+        // Viewer mode — tail an existing .jsonl file.
+        let path = PathBuf::from(&positional);
+        if !path.exists() {
+            bail!("file not found: {}", path.display());
+        }
+        add_dirs = vec![];
+        tailer_path = path;
+    }
+
+    // Start the tailer. In REPL mode the file may not exist yet (the CLI
+    // creates it on the first API call), but the tailer polls until it appears.
     let (tx, mut rx) = mpsc::channel(256);
-    let tailer_tx = tx.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_tailer(tailer_path, tailer_tx).await {
+        if let Err(e) = run_tailer(tailer_path, tx).await {
             tracing::error!("tailer error: {}", e);
         }
     });
@@ -208,12 +270,6 @@ async fn main() -> Result<()> {
     let mut app = App::new(repl_mode);
     let mut events = EventStream::new();
     let mut frame_interval = tokio::time::interval(Duration::from_millis(33));
-
-    // The Invocation and its stdout event channel. Both are None when no child
-    // process is running (between prompts, or in viewer-only mode). Spawned on
-    // the first prompt submission, dropped after each round drains.
-    let mut invocation: Option<Invocation> = None;
-    let mut claude_rx: Option<EventReceiver> = None;
 
     loop {
         tokio::select! {
@@ -348,18 +404,21 @@ async fn main() -> Result<()> {
                             && key.code == KeyCode::Enter
                         {
                             if let Some(prompt) = app.submit_input() {
-                                let sid = session_id.clone().unwrap();
-                                let target = ResumeTarget::SessionId(sid);
+                                // If no invocation is running, spawn one.
+                                // Bootstrap may have left one waiting.
+                                if invocation.is_none() {
+                                    let sid = session_id.clone().unwrap();
+                                    let target = ResumeTarget::SessionId(sid);
 
-                                match Invocation::spawn(target, None) {
-                                    Ok((inv, rx)) => {
-                                        invocation = Some(inv);
-                                        claude_rx = Some(rx);
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("failed to spawn claude: {}", e);
-                                        // don't change run_state, stay idle
-                                        continue;
+                                    match Invocation::spawn(target, None, &add_dirs) {
+                                        Ok((inv, rx)) => {
+                                            invocation = Some(inv);
+                                            claude_rx = Some(rx);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("failed to spawn claude: {}", e);
+                                            continue;
+                                        }
                                     }
                                 }
 
