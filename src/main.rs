@@ -29,6 +29,7 @@
 
 mod app;
 mod claude;
+mod config;
 mod model;
 mod parser;
 mod render;
