@@ -1,0 +1,31 @@
+#!/usr/bin/env zshctl
+
+function :args {
+    eval "$(args t,transcript o,output s,slug -b y,yolo -- "$@")"
+}
+
+function :execute {
+    print "$@"
+    typeset kickoff=${1:-} inject
+    shift
+    [[ -z $kickoff ]] && abend 'you need at least one message'
+    integer puzzle_in puzzle_out
+    coproc zsh puzzle.zsh
+    exec {puzzle_in}>&p
+    exec {puzzle_out}<&p
+    coproc :
+
+    jo kickoff=$kickoff transcript='[]' -b yolo=0 >&${puzzle_in}
+
+    while (( $# )); do
+        inject=${1:-}
+        [[ -z $inject ]] && continue
+        jo 'type=user' message="$(jo 'role=user' "content=$inject")" | >&${claude_in}
+    done
+
+    while read -r line; do
+        print $line
+    done <&${puzzle_out}
+}
+
+# vim: ft=zsh :
