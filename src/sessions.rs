@@ -1,11 +1,10 @@
-#![allow(dead_code)] // API surface for 011 session dictionary; not yet wired into main
-
 // Session ID tracking. Each pane window gets a JSONL file at
-// ~/.config/puzzle/<slug>/sessions.jsonl. The most recent line is the current
-// session. Append to record a new session, read the last line to resume.
+// ~/.local/state/puzzle/<slug>/sessions.jsonl. The most recent line is the
+// current session. Append to record a new session, read the last line to
+// resume.
 //
 // The slug is the directory name under ~/pane/ — "puzzle" for ~/pane/puzzle.
-// Each slug gets its own directory in case other per-window state appears later.
+// Each slug gets its own directory alongside its windows/ subdirectory.
 //
 // The format is one JSON object per line with at minimum a session_id field.
 // A timestamp is included for human readability when tailing the file by hand.
@@ -24,7 +23,7 @@ pub struct SessionEntry {
 }
 
 /// Build the path to the sessions file for a slug.
-/// ~/.config/puzzle/<slug>/sessions.jsonl
+/// ~/.local/state/puzzle/<slug>/sessions.jsonl
 pub fn sessions_path(config_dir: &Path, slug: &str) -> PathBuf {
     config_dir.join(slug).join("sessions.jsonl")
 }
@@ -198,11 +197,11 @@ mod tests {
 
     #[test]
     fn sessions_path_structure() {
-        let config = Path::new("/home/alan/.config/puzzle");
-        let path = sessions_path(config, "puzzle");
+        let state = Path::new("/home/alan/.local/state/puzzle");
+        let path = sessions_path(state, "puzzle");
         assert_eq!(
             path,
-            PathBuf::from("/home/alan/.config/puzzle/puzzle/sessions.jsonl")
+            PathBuf::from("/home/alan/.local/state/puzzle/puzzle/sessions.jsonl")
         );
     }
 

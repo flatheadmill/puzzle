@@ -1,31 +1,24 @@
-// Puzzle: a TUI for reading Claude Code session transcripts with thinking
-// blocks visible. The core conviction: claude --print does the heavy lifting,
-// Puzzle is just a different renderer for what it produces.
+// Puzzle: a TUI for Claude Code conversations. Two modes: viewer (tails an
+// existing JSONL transcript) and REPL (orchestrates Claude through Easement).
 //
-// Two modes of operation: viewer (tails an existing JSONL transcript) and REPL
-// (orchestrates claude --print via the Invocation abstraction in claude.rs and
-// tails the session file it writes to). The event loop is tokio::select! across
-// four sources: a frame timer at 33ms for screen refresh, the tailer channel
-// for new conversation entries, the claude stdout event channel for process
-// lifecycle and drain tracking, and crossterm's EventStream for keyboard input.
+// In REPL mode, Puzzle spawns Easement per spurt. Easement wraps the Claude
+// CLI and multiplexes output into typed NDJSON envelopes. Puzzle reads one
+// stream and routes by the stream field: stdout events drive the drain gate,
+// transcript entries feed the official transcript for deduplication and
+// persistence, then new entries push to the UI.
 //
-// The REPL spawns one Invocation per prompt cycle. The Invocation holds a child
-// process with --input-format stream-json, writes NDJSON to stdin, reads events
-// from stdout. When the round completes (result event, all messages drained),
-// the Invocation shuts down and a new one is spawned for the next prompt. The
-// tailer is independent — it watches the JSONL file on disk, not the process.
-// This means the tailer survives across child process boundaries.
+// The event loop is tokio::select! across four sources: a frame timer at 33ms,
+// the tailer channel (viewer mode only), the Easement event channel for stdout
+// and transcript envelopes, and crossterm's EventStream for keyboard input.
 //
-// The rendering pipeline: File Tailer (100ms polling) → Parser (serde, kebab-
-// case tag enum) → Model (filter user/assistant on main chain, summarize tool
-// input) → Renderer (styled Lines per content block) → App (scroll state,
-// follow mode, input) → Terminal (ratatui List widget with Scrollbar). The
-// input area is separate from this pipeline — it is a tui-textarea widget that
-// renders itself into its own Rect and manages its own cursor.
+// State lives under ~/.local/state/puzzle/<slug>/ with sessions.jsonl for
+// session tracking and windows/<timestamp>/ directories for each window
+// lifetime. The official transcript at transcript.jsonl is the deduplicated
+// record of the conversation. It feeds the UI and serves as the portable
+// artifact for machine migration.
 //
 // Logging goes to /tmp/puzzle.log via tracing with a non-blocking file writer.
-// RUST_LOG controls the filter; defaults to puzzle=debug. The subscriber is
-// initialized before the TUI so early errors are captured.
+// RUST_LOG controls the filter; defaults to puzzle=debug.
 
 mod app;
 mod claude;
@@ -35,6 +28,7 @@ mod sessions;
 mod parser;
 mod render;
 mod tailer;
+mod transcript;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -53,11 +47,12 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::{App, Mode, RunState};
-use crate::claude::{EasementEvent, EventReceiver, Invocation, Payload};
+use crate::claude::{EasementEvent, EventReceiver, Invocation, Payload, StdoutEvent};
 use crate::model::{try_convert, ContentBlock, EntryKind};
 use crate::parser::parse_line;
 use crate::render::render_entry;
 use crate::tailer::run_tailer;
+use crate::transcript::Transcript;
 
 fn check_parse(path: &PathBuf) -> Result<()> {
     let content = std::fs::read_to_string(path)?;
@@ -110,15 +105,20 @@ fn check_parse(path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-// Initialize tracing with a non-blocking file writer so log output goes to
-// /tmp/puzzle.log instead of fighting the TUI on stdout/stderr. The guard
-// must be held for the program's lifetime to ensure the writer flushes.
+// Initialize tracing with a non-blocking file writer at
+// ~/.local/state/puzzle/puzzle.log. The guard must be held for the
+// program's lifetime to ensure the writer flushes.
 fn init_tracing() -> WorkerGuard {
+    let home = std::env::var("HOME").expect("HOME not set");
+    let log_dir = std::path::Path::new(&home)
+        .join(".local").join("state").join("puzzle");
+    let _ = std::fs::create_dir_all(&log_dir);
+
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/puzzle.log")
-        .expect("failed to open /tmp/puzzle.log");
+        .open(log_dir.join("puzzle.log"))
+        .expect("failed to open puzzle.log");
 
     let (non_blocking, guard) = tracing_appender::non_blocking(log_file);
 
@@ -143,6 +143,61 @@ async fn recv_easement(rx: &mut Option<EventReceiver>) -> Option<EasementEvent> 
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// Format a timestamp for the window directory name. Uses the same style
+/// as the phase doc examples: 2026-02-22T04-30-00.123.
+fn window_timestamp() -> String {
+    use std::time::SystemTime;
+    let dur = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let secs = dur.as_secs();
+    let millis = dur.subsec_millis();
+
+    // Convert unix timestamp to UTC components. No chrono dependency.
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Days since epoch to Y-M-D. Good until 2100.
+    let mut y = 1970;
+    let mut remaining = days;
+    loop {
+        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if remaining < days_in_year {
+            break;
+        }
+        remaining -= days_in_year;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let month_days: [u64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+    let mut m = 0;
+    for days_in_month in &month_days {
+        if remaining < *days_in_month {
+            break;
+        }
+        remaining -= days_in_month;
+        m += 1;
+    }
+    let d = remaining + 1;
+    m += 1;
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}-{:02}-{:02}.{:03}",
+        y, m, d, hours, minutes, seconds, millis,
+    )
 }
 
 #[tokio::main]
@@ -179,8 +234,9 @@ async fn main() -> Result<()> {
     let mut invocation: Option<Invocation> = None;
     let mut claude_rx: Option<EventReceiver> = None;
     let slug: Option<String>;
-    let puzzle_config_dir: PathBuf;
+    let puzzle_state_dir: PathBuf;
     let viewer_path: Option<PathBuf>;
+    let mut transcript: Option<Transcript> = None;
 
     if repl_mode {
         let s = positional.clone();
@@ -198,21 +254,32 @@ async fn main() -> Result<()> {
         config::modify_config(&config_path, |c| config::ensure_trust(c, pane_dir_str))
             .map_err(|e| color_eyre::eyre::eyre!("{}", e))?;
 
-        puzzle_config_dir = PathBuf::from(&home).join(".config").join("puzzle");
+        puzzle_state_dir = PathBuf::from(&home)
+            .join(".local").join("state").join("puzzle");
 
         // Set working directory to the pane dir.
         std::env::set_current_dir(&pane_dir)?;
 
+        // Create this window's state directory with a timestamped name.
+        let window_ts = window_timestamp();
+        let window_dir = puzzle_state_dir
+            .join(&s).join("windows").join(&window_ts);
+        std::fs::create_dir_all(&window_dir)?;
+
+        let transcript_path = window_dir.join("transcript.jsonl");
+        transcript = Some(Transcript::new(transcript_path));
+
         // Look up the latest session. If none exists, bootstrap is
         // deferred to the first prompt because Easement requires a
         // kickoff message in the payload.
-        if let Some(sid) = sessions::latest_session(&puzzle_config_dir, &s) {
-            sessions::record_session(&puzzle_config_dir, &s, &sid)?;
+        if let Some(sid) = sessions::latest_session(&puzzle_state_dir, &s) {
+            sessions::record_session(&puzzle_state_dir, &s, &sid)?;
             session_id = Some(sid);
         }
     } else {
         slug = None;
-        puzzle_config_dir = PathBuf::from(&home).join(".config").join("puzzle");
+        puzzle_state_dir = PathBuf::from(&home)
+            .join(".local").join("state").join("puzzle");
 
         // Viewer mode — tail an existing .jsonl file.
         let path = PathBuf::from(&positional);
@@ -329,6 +396,19 @@ async fn main() -> Result<()> {
                 match event {
                     Some(EasementEvent::Stdout(stdout_event)) => {
                         if let Some(ref mut inv) = invocation {
+                            // Capture the first assistant message UUID as the
+                            // boundary for transcript deduplication.
+                            if let StdoutEvent::Assistant { ref message, .. } = stdout_event {
+                                if let Some(ref mut t) = transcript {
+                                    if let Some(uuid) = message.get("uuid").and_then(|v| v.as_str()) {
+                                        let new_entries = t.set_boundary(uuid.to_string());
+                                        for entry in new_entries {
+                                            app.push_entry(entry);
+                                        }
+                                    }
+                                }
+                            }
+
                             let drained = inv.handle_event(&stdout_event);
 
                             // On first session ID capture from a bootstrap,
@@ -336,7 +416,7 @@ async fn main() -> Result<()> {
                             if session_id.is_none() {
                                 if let Some(sid) = inv.session_id() {
                                     if let Some(ref s) = slug {
-                                        let _ = sessions::record_session(&puzzle_config_dir, s, sid);
+                                        let _ = sessions::record_session(&puzzle_state_dir, s, sid);
                                     }
                                     session_id = Some(sid.to_string());
                                 }
@@ -356,12 +436,22 @@ async fn main() -> Result<()> {
                         }
                     }
                     Some(EasementEvent::Transcript(data)) => {
-                        // Transcript entries from Easement feed the UI
-                        // through the same parse pipeline as the tailer.
-                        let json = serde_json::to_string(&data).unwrap_or_default();
-                        if let Some(entry) = parse_line(&json) {
-                            if let Some(ce) = try_convert(entry) {
-                                app.push_entry(ce);
+                        // Transcript entries pass through the transcript
+                        // layer for deduplication and persistence. On the
+                        // first spurt, everything is new. On subsequent
+                        // spurts, history replay is skipped.
+                        if let Some(ref mut t) = transcript {
+                            let new_entries = t.handle_envelope(data);
+                            for entry in new_entries {
+                                app.push_entry(entry);
+                            }
+                        } else {
+                            // Viewer mode fallback — no transcript layer.
+                            let json = serde_json::to_string(&data).unwrap_or_default();
+                            if let Some(entry) = parse_line(&json) {
+                                if let Some(ce) = try_convert(entry) {
+                                    app.push_entry(ce);
+                                }
                             }
                         }
                     }
@@ -389,9 +479,10 @@ async fn main() -> Result<()> {
                         {
                             if let Some(prompt) = app.submit_input() {
                                 if let Some(ref s) = slug {
-                                    // Build the Easement payload. If we have
-                                    // a session ID, resume it. Otherwise,
-                                    // bootstrap with an empty transcript.
+                                    if let Some(ref mut t) = transcript {
+                                        t.begin_spurt();
+                                    }
+
                                     let payload = Payload {
                                         slug: s.clone(),
                                         yolo: false,
