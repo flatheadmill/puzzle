@@ -53,7 +53,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::{App, Mode, RunState};
-use crate::claude::{EventReceiver, Invocation, ResumeTarget, StdoutEvent};
+use crate::claude::{EasementEvent, EventReceiver, Invocation, Payload};
 use crate::model::{try_convert, ContentBlock, EntryKind};
 use crate::parser::parse_line;
 use crate::render::render_entry;
@@ -135,10 +135,10 @@ fn init_tracing() -> WorkerGuard {
     guard
 }
 
-/// Receives the next stdout event from the Claude process, or pends forever
-/// if no invocation is active. Used as a select! arm that effectively disables
-/// itself when there is no child process running.
-async fn recv_claude(rx: &mut Option<EventReceiver>) -> Option<StdoutEvent> {
+/// Receives the next event from Easement, or pends forever if no invocation
+/// is active. Used as a select! arm that effectively disables itself when
+/// there is no child process running.
+async fn recv_easement(rx: &mut Option<EventReceiver>) -> Option<EasementEvent> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
@@ -178,14 +178,17 @@ async fn main() -> Result<()> {
     let mut session_id: Option<String> = None;
     let mut invocation: Option<Invocation> = None;
     let mut claude_rx: Option<EventReceiver> = None;
-    let add_dirs: Vec<String>;
-    let tailer_path: PathBuf;
+    let slug: Option<String>;
+    let puzzle_config_dir: PathBuf;
+    let viewer_path: Option<PathBuf>;
 
     if repl_mode {
-        let slug = &positional;
+        let s = positional.clone();
+        slug = Some(s.clone());
+        viewer_path = None;
 
         // Ensure the pane directory exists.
-        let pane_dir = PathBuf::from(&home).join("pane").join(slug);
+        let pane_dir = PathBuf::from(&home).join("pane").join(&s);
         std::fs::create_dir_all(&pane_dir)?;
 
         // Ensure trust so the CLI skips the approval dialog.
@@ -195,76 +198,43 @@ async fn main() -> Result<()> {
         config::modify_config(&config_path, |c| config::ensure_trust(c, pane_dir_str))
             .map_err(|e| color_eyre::eyre::eyre!("{}", e))?;
 
-        // Look up the latest session for this slug.
-        let puzzle_config_dir = PathBuf::from(&home).join(".config").join("puzzle");
+        puzzle_config_dir = PathBuf::from(&home).join(".config").join("puzzle");
 
-        // Set working directory to the pane dir so the CLI and
-        // session_jsonl_path both resolve against it.
+        // Set working directory to the pane dir.
         std::env::set_current_dir(&pane_dir)?;
 
-        add_dirs = vec![format!("{}/code", home)];
-
-        match sessions::latest_session(&puzzle_config_dir, slug) {
-            Some(sid) => {
-                // Existing session — record optimistically, derive JSONL path.
-                sessions::record_session(&puzzle_config_dir, slug, &sid)?;
-                tailer_path = session_jsonl_path(&sid)?;
-                session_id = Some(sid);
-            }
-            None => {
-                // Bootstrap — fork from an empty touched file to get a new session.
-                let temp_path = std::env::temp_dir()
-                    .join(format!("puzzle-bootstrap-{}.jsonl", slug));
-                std::fs::write(&temp_path, "")?;
-
-                let (mut inv, mut inv_rx) = Invocation::spawn(
-                    ResumeTarget::FilePath(temp_path.to_string_lossy().to_string()),
-                    None,
-                    &add_dirs,
-                )?;
-
-                // Read stdout events until the session ID appears. The CLI
-                // emits it in the first event (system hook_started).
-                let mut captured_sid = None;
-                while let Some(event) = inv_rx.recv().await {
-                    inv.handle_event(&event);
-                    if let Some(sid) = inv.session_id() {
-                        captured_sid = Some(sid.to_string());
-                        break;
-                    }
-                }
-
-                let sid = captured_sid.ok_or_else(|| {
-                    color_eyre::eyre::eyre!("bootstrap: CLI exited without emitting a session ID")
-                })?;
-
-                sessions::record_session(&puzzle_config_dir, slug, &sid)?;
-                let _ = std::fs::remove_file(&temp_path);
-
-                tailer_path = session_jsonl_path(&sid)?;
-                session_id = Some(sid);
-                invocation = Some(inv);
-                claude_rx = Some(inv_rx);
-            }
+        // Look up the latest session. If none exists, bootstrap is
+        // deferred to the first prompt because Easement requires a
+        // kickoff message in the payload.
+        if let Some(sid) = sessions::latest_session(&puzzle_config_dir, &s) {
+            sessions::record_session(&puzzle_config_dir, &s, &sid)?;
+            session_id = Some(sid);
         }
     } else {
+        slug = None;
+        puzzle_config_dir = PathBuf::from(&home).join(".config").join("puzzle");
+
         // Viewer mode — tail an existing .jsonl file.
         let path = PathBuf::from(&positional);
         if !path.exists() {
             bail!("file not found: {}", path.display());
         }
-        add_dirs = vec![];
-        tailer_path = path;
+        viewer_path = Some(path);
     }
 
-    // Start the tailer. In REPL mode the file may not exist yet (the CLI
-    // creates it on the first API call), but the tailer polls until it appears.
+    // In REPL mode, transcript entries arrive through Easement's envelope
+    // stream — Puzzle does not touch Claude's filesystem. The tailer is
+    // only used in viewer mode to tail an existing JSONL file.
     let (tx, mut rx) = mpsc::channel(256);
-    tokio::spawn(async move {
-        if let Err(e) = run_tailer(tailer_path, tx).await {
-            tracing::error!("tailer error: {}", e);
-        }
-    });
+
+    if let Some(path) = viewer_path {
+        let tailer_tx = tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_tailer(path, tailer_tx).await {
+                tracing::error!("tailer error: {}", e);
+            }
+        });
+    }
 
     let mut terminal = ratatui::init();
     let mut app = App::new(repl_mode);
@@ -355,16 +325,24 @@ async fn main() -> Result<()> {
             Some(entry) = rx.recv() => {
                 app.push_entry(entry);
             }
-            event = recv_claude(&mut claude_rx) => {
+            event = recv_easement(&mut claude_rx) => {
                 match event {
-                    Some(event) => {
+                    Some(EasementEvent::Stdout(stdout_event)) => {
                         if let Some(ref mut inv) = invocation {
-                            let drained = inv.handle_event(&event);
+                            let drained = inv.handle_event(&stdout_event);
+
+                            // On first session ID capture from a bootstrap,
+                            // record the session.
+                            if session_id.is_none() {
+                                if let Some(sid) = inv.session_id() {
+                                    if let Some(ref s) = slug {
+                                        let _ = sessions::record_session(&puzzle_config_dir, s, sid);
+                                    }
+                                    session_id = Some(sid.to_string());
+                                }
+                            }
+
                             if drained {
-                                // Capture session ID before dropping the invocation.
-                                // This feeds the next Invocation::spawn() with the
-                                // correct session, including after file path forks
-                                // where the CLI generated a new UUID.
                                 if let Some(sid) = inv.session_id() {
                                     session_id = Some(sid.to_string());
                                 }
@@ -377,11 +355,17 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
+                    Some(EasementEvent::Transcript(data)) => {
+                        // Transcript entries from Easement feed the UI
+                        // through the same parse pipeline as the tailer.
+                        let json = serde_json::to_string(&data).unwrap_or_default();
+                        if let Some(entry) = parse_line(&json) {
+                            if let Some(ce) = try_convert(entry) {
+                                app.push_entry(ce);
+                            }
+                        }
+                    }
                     None => {
-                        // Channel closed — the child process exited or the stdout
-                        // pipe broke. Capture session ID and clean up. shutdown()
-                        // is safe here: if the child already exited, wait() returns
-                        // immediately.
                         if let Some(inv) = invocation.take() {
                             if let Some(sid) = inv.session_id() {
                                 session_id = Some(sid.to_string());
@@ -404,33 +388,31 @@ async fn main() -> Result<()> {
                             && key.code == KeyCode::Enter
                         {
                             if let Some(prompt) = app.submit_input() {
-                                // If no invocation is running, spawn one.
-                                // Bootstrap may have left one waiting.
-                                if invocation.is_none() {
-                                    let sid = session_id.clone().unwrap();
-                                    let target = ResumeTarget::SessionId(sid);
+                                if let Some(ref s) = slug {
+                                    // Build the Easement payload. If we have
+                                    // a session ID, resume it. Otherwise,
+                                    // bootstrap with an empty transcript.
+                                    let payload = Payload {
+                                        slug: s.clone(),
+                                        yolo: false,
+                                        message: prompt,
+                                        session_id: session_id.clone(),
+                                        transcript: if session_id.is_none() {
+                                            Some(vec![])
+                                        } else {
+                                            None
+                                        },
+                                    };
 
-                                    match Invocation::spawn(target, None, &add_dirs) {
-                                        Ok((inv, rx)) => {
+                                    match Invocation::spawn(payload).await {
+                                        Ok((inv, erx)) => {
                                             invocation = Some(inv);
-                                            claude_rx = Some(rx);
+                                            claude_rx = Some(erx);
                                         }
                                         Err(e) => {
-                                            tracing::error!("failed to spawn claude: {}", e);
+                                            tracing::error!("failed to spawn easement: {}", e);
                                             continue;
                                         }
-                                    }
-                                }
-
-                                if let Some(ref mut inv) = invocation {
-                                    if let Err(e) = inv.send(&prompt).await {
-                                        tracing::error!("failed to send prompt: {}", e);
-                                        // clean up the failed invocation
-                                        if let Some(inv) = invocation.take() {
-                                            let _ = inv.shutdown().await;
-                                        }
-                                        claude_rx = None;
-                                        continue;
                                     }
                                 }
 
@@ -452,22 +434,4 @@ async fn main() -> Result<()> {
 
     ratatui::restore();
     Ok(())
-}
-
-/// Build the JSONL path for a session ID from the cwd.
-/// ~/.claude/projects/<cwd-slug>/<session-id>.jsonl
-fn session_jsonl_path(session_id: &str) -> Result<PathBuf> {
-    let cwd = std::env::current_dir()?;
-    let home = std::env::var("HOME")
-        .map_err(|e| color_eyre::eyre::eyre!("HOME not set: {}", e))?;
-
-    let cwd_str = cwd.to_str()
-        .ok_or_else(|| color_eyre::eyre::eyre!("cwd is not valid UTF-8"))?;
-    let slug = cwd_str.replace('/', "-");
-
-    Ok(PathBuf::from(&home)
-        .join(".claude")
-        .join("projects")
-        .join(&slug)
-        .join(format!("{}.jsonl", session_id)))
 }

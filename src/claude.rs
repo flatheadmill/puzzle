@@ -1,68 +1,26 @@
-// Claude process abstraction. This module models one invocation of the Claude
-// CLI as a child process with a bidirectional NDJSON channel. The struct IS the
-// invocation — it is created, it runs, it drains, it is dropped. There is no
-// long-lived session manager. The session state lives in the JSONL transcript
-// on disk, not in this struct. When the invocation is done, create a new one
-// with --resume against the same session.
+// Easement client. This module spawns the Easement binary and speaks its
+// envelope protocol. Easement wraps the Claude CLI — it handles spawning,
+// flags, transcript discovery, and output multiplexing. Puzzle sends a JSON
+// payload as the first line of stdin, then NDJSON messages after. Easement
+// sends back typed envelopes: {"stream":"stdout","data":{...}} for Claude
+// events, {"stream":"transcript","data":{...}} for JSONL entries,
+// {"stream":"meta","data":{...}} for session info, {"stream":"error",...}
+// for failures. Puzzle unwraps the stdout envelopes and parses the data
+// field into StdoutEvent for drain gate tracking.
 //
-// The discovery that drives this design came from FIFO and coproc testing
-// against the live CLI (~/code/junk/eof.zsh is the reference harness). The
-// key findings:
+// The struct IS the invocation — it is created, it runs, it drains, it is
+// dropped. The session state lives in the JSONL transcript on disk, not in
+// this struct. When the invocation is done, create a new one with the same
+// session ID.
 //
-// 1. --input-format stream-json works with --print. No positional prompt
-//    argument is required. The process starts, hooks fire, and it waits for
-//    NDJSON user messages on stdin.
+// The drain gate stays in Puzzle. Easement is a transparent pipe — it does
+// not interpret Claude's stdout events. Puzzle tracks sent/replayed counts
+// and flips the drain flag at result boundaries.
 //
-// 2. Each round on stdout follows: system:init -> assistant/user flurry ->
-//    result:success. The init event fires per round, not per process. The
-//    result event is the completion boundary.
-//
-// 3. User messages injected mid-turn are absorbed into the current round.
-//    They appear in the JSONL transcript on disk but NOT on stdout — unless
-//    --replay-user-messages is set. With that flag, injected messages appear
-//    on stdout with "isReplay":true, making them countable.
-//
-// 4. Closing stdin prematurely (before the result event) kills the process
-//    before the turn completes. Stdin must stay open until the round finishes.
-//    The correct shutdown: wait for result, then close stdin. The process sees
-//    EOF and exits cleanly with a flushed transcript.
-//
-// 5. The JSONL transcript on disk and the stdout stream are different formats.
-//    The transcript has queue-operation, progress, parentUuid, isSidechain,
-//    slug, requestId — rich conversation record. Stdout has system:init,
-//    result:success, and sparser event schemas. The result event only exists
-//    on stdout. The queue-operation events only exist in the JSONL.
-//
-// 6. Mid-turn injection works but not between parallel tool calls. Messages
-//    sent during tool execution are queued and appear on the next API call
-//    within the same round. Claude sees them and can acknowledge them. But
-//    they don't interrupt running tools and they don't create separate rounds.
-//    Once the result event arrives, any subsequent message starts a new round
-//    with fresh reasoning.
-//
-// 7. The JSONL transcript is the portable artifact. Stop a process on one
-//    machine, resume on another with --resume <session-id>. The process is
-//    ephemeral. The session is the state.
-//
-// 8. --resume accepts either a session ID or a .jsonl file path. When given
-//    a file path, the CLI generates a new random UUID as the session ID,
-//    reads the file for history (filtering to assistant/user entries and
-//    applying cleanup transforms), and writes the new session to its own
-//    JSONL under ~/.claude/projects/. The original file is read-only input.
-//    When given a session ID, it resumes in place. This fork behavior is
-//    how environment transitions work: copy the JSONL to the target, resume
-//    from the file path, get a new session ID back. Subsequent resumes on
-//    that machine use the session ID directly. Tested with clone.zsh and
-//    touch.zsh — an empty touched file also works, producing a fresh session
-//    with no history. The new session ID appears in every stdout event
-//    starting from the first (system hook_started), so the Invocation
-//    captures it from the stream and always exposes it to the caller.
-//    (cli.js:543099-543106 — file path detection and randomUUID generation.)
-//
-// The concurrency model matches what main.rs already does: a spawned task
-// reads the child's stdout and sends events through an mpsc channel. The main
-// loop's tokio::select! gains a branch for this channel. The struct lives in
-// the main loop. No mutex.
+// The payload includes a kickoff message because Claude does not create the
+// transcript until the first API call. Easement sends this message
+// immediately after spawning Claude. Subsequent messages go through stdin
+// passthrough via send().
 
 use std::process::Stdio;
 
@@ -72,28 +30,42 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+// -- Easement envelope --
+
+#[derive(Debug, Deserialize)]
+struct Envelope {
+    stream: String,
+    data: serde_json::Value,
+}
+
+// -- Easement payload --
+
+#[derive(Debug, Serialize)]
+pub struct Payload {
+    pub slug: String,
+    #[serde(default)]
+    pub yolo: bool,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<Vec<serde_json::Value>>,
+}
+
 // -- Stdout event types --
 //
-// The stdout stream-json output has a different schema from the JSONL transcript
-// on disk. These types model what comes out of stdout, not what's in the file.
-// The tailer (tailer.rs) reads the file. This module reads stdout.
-//
-// We deserialize loosely — serde(tag = "type") with an Unknown catch-all — so
-// new event types from future CLI versions don't break us. We only care about
-// a few event types: result (drain signal), system:init (round start marker),
-// and user messages with isReplay (for counting injected messages).
+// These types model what comes out of Claude's stdout, wrapped inside
+// Easement's {"stream":"stdout","data":{...}} envelopes. The drain gate
+// logic depends on result events and replayed user messages.
 
-/// A single event from the child's stdout stream. The CLI emits one NDJSON
-/// line per event. We parse the type to decide what matters.
+/// A single event from Claude's stdout stream, unwrapped from an Easement
+/// envelope. We parse the type to decide what matters.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)] // fields parsed for completeness; available as rendering gets richer
+#[allow(dead_code)]
 pub enum StdoutEvent {
-    /// The result event is the per-round completion boundary. When Puzzle sees
-    /// this, the round is done. If nothing is queued on Puzzle's side, the
-    /// process is idle and stdin can be closed. The result carries cumulative
-    /// cost, usage, and duration for the entire process lifetime.
+    /// The result event is the per-round completion boundary.
     Result {
         subtype: Option<String>,
         #[serde(default)]
@@ -104,28 +76,20 @@ pub enum StdoutEvent {
         session_id: Option<String>,
     },
 
-    /// The init event fires at the start of every round — each time a user
-    /// message triggers an API call. It carries session metadata, tools, model.
-    /// The very first round also gets hook events and a rate_limit_event before
-    /// this, but subsequent rounds just get init.
+    /// The init event fires at the start of every round.
     System {
         subtype: Option<String>,
         session_id: Option<String>,
     },
 
-    /// Assistant messages from the model. These include text responses, tool_use
-    /// blocks, and thinking blocks. They appear between init and result. Multiple
-    /// assistant events can occur per round (text + tool calls, or parallel tool
-    /// calls sharing the same message id).
+    /// Assistant messages from the model.
     Assistant {
         message: serde_json::Value,
         session_id: Option<String>,
     },
 
-    /// User messages on stdout. Without --replay-user-messages, only tool_result
-    /// messages appear (the CLI's internal tool result delivery). With the flag,
-    /// injected user messages also appear with "isReplay":true. This is how we
-    /// count absorbed messages.
+    /// User messages on stdout. With --replay-user-messages, injected
+    /// messages appear with "isReplay":true for counting.
     User {
         message: serde_json::Value,
         session_id: Option<String>,
@@ -134,25 +98,22 @@ pub enum StdoutEvent {
         is_replay: bool,
     },
 
-    /// Rate limit check that fires once at process start before the first round.
+    /// Rate limit check that fires once at process start.
     RateLimitEvent {
         rate_limit_info: serde_json::Value,
     },
 
-    /// Anything we don't recognize. Future CLI versions may add event types.
-    /// We ignore them rather than crashing.
+    /// Anything we don't recognize.
     #[serde(other)]
     Unknown,
 }
 
 // -- Stdin message types --
 //
-// The NDJSON protocol for writing to the child's stdin. Three message types
-// matter. Malformed JSON kills the child (process.exit(1) in the CLI source),
-// so serialization must be correct. These types are not configurable — they
-// are the protocol.
+// These go through Easement's stdin passthrough to Claude. The payload
+// line carries the kickoff message, so these are for subsequent messages
+// within the same invocation.
 
-/// A user message written to stdin. This is what triggers a round.
 #[derive(Debug, Serialize)]
 struct UserMessage {
     r#type: &'static str,
@@ -166,11 +127,7 @@ struct UserMessageContent {
     content: String,
 }
 
-#[allow(dead_code)] // interrupt and keep_alive not yet wired; API surface for mid-turn control
-/// An interrupt request. Cancels the current turn via an abort controller in
-/// the CLI. After the turn unwinds, the executor clears its running flag and
-/// processes the next queued command. Pattern for urgent intervention: send
-/// interrupt, then send user message with the warning.
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 struct InterruptRequest {
     r#type: &'static str,
@@ -182,9 +139,6 @@ struct InterruptSubtype {
     subtype: &'static str,
 }
 
-/// A keep-alive heartbeat. Accepted and silently ignored by the CLI parser.
-/// Puzzle can send these periodically to keep the pipe active during long
-/// idle periods.
 #[derive(Debug, Serialize)]
 #[allow(dead_code)]
 struct KeepAlive {
@@ -192,41 +146,8 @@ struct KeepAlive {
 }
 
 // -- The invocation --
-//
-// One struct, one child process. Calling spawn() starts the child. Messages
-// go in via send(). Events come out via the mpsc channel returned from
-// spawn(). When the result event arrives and nothing is queued, call
-// shutdown() to close stdin. The child exits. The struct is done. Drop it.
-//
-// If you call send() after shutdown(), that is a bug. The invocation is over.
-// New messages need a new Invocation with --resume against the same session.
-//
-// The invocation flags are internal. They are how Puzzle talks to Claude:
-//   --print                       headless mode, no TUI
-//   --input-format stream-json    NDJSON on stdin
-//   --output-format stream-json   NDJSON on stdout
-//   --replay-user-messages        injected messages appear on stdout
-//   --verbose                     required with --output-format stream-json
-//   --max-thinking-tokens 31999   hidden flag, enables extended thinking
-//   --resume <target>             session ID or .jsonl file path
-//
-// The --allowed-tools flag may be added later to restrict the tool set.
-// The --permission-prompt-tool flag is for the MCP approval relay (step 012).
 
-/// What to pass to --resume. A session ID resumes in place. A file path
-/// forks — the CLI reads the file for history, generates a new session ID,
-/// and writes to its own JSONL under ~/.claude/projects/. An empty touched
-/// file works too, producing a fresh session with no history.
-#[allow(dead_code)] // FilePath variant is the fork mechanism; not yet wired in main
-pub enum ResumeTarget {
-    /// A session UUID. Resumes the existing session in place.
-    SessionId(String),
-    /// A .jsonl file path. The CLI forks: reads history from the file,
-    /// creates a new session with a new UUID. The file is read-only input.
-    FilePath(String),
-}
-
-#[allow(dead_code)] // sent/replayed/model not yet read externally; API surface for future use
+#[allow(dead_code)]
 pub struct Invocation {
     child: Child,
     stdin: Option<tokio::process::ChildStdin>,
@@ -234,72 +155,50 @@ pub struct Invocation {
     replayed: u64,
     drained: bool,
     session_id: Option<String>,
-    model: Option<String>,
 }
 
-/// What the main loop receives from the stdout reader task. This is the
-/// channel type — it carries parsed events from the child's stdout.
-pub type EventReceiver = mpsc::Receiver<StdoutEvent>;
+/// What the main loop receives from the envelope reader task. Stdout
+/// events drive the drain gate. Transcript entries feed the UI.
+pub enum EasementEvent {
+    Stdout(StdoutEvent),
+    Transcript(serde_json::Value),
+}
 
-#[allow(dead_code)] // interrupt, keep_alive, is_drained, sent, replayed: API surface for future use
+pub type EventReceiver = mpsc::Receiver<EasementEvent>;
+
+#[allow(dead_code)]
 impl Invocation {
-    /// Create and spawn a new invocation. Returns the invocation and a channel
-    /// receiver for stdout events. The caller (main loop) reads from the
-    /// receiver in its tokio::select! loop.
-    ///
-    /// The child process starts immediately. Hooks fire. The process waits for
-    /// the first user message on stdin. Nothing happens until send() is called.
-    ///
-    /// The resume target determines what --resume gets. A session ID resumes
-    /// in place. A file path forks into a new session. Either way, the CLI
-    /// emits a session ID in stdout events starting from the first event.
-    /// The Invocation captures it via handle_event and exposes it through
-    /// session_id(). The caller always gets the session ID back.
-    pub fn spawn(
-        target: ResumeTarget,
-        model: Option<String>,
-        add_dirs: &[String],
-    ) -> Result<(Self, EventReceiver), std::io::Error> {
-        let resume_arg = match &target {
-            ResumeTarget::SessionId(id) => id.clone(),
-            ResumeTarget::FilePath(path) => path.clone(),
-        };
+    /// Spawn Easement with a payload. The payload includes the kickoff
+    /// message, so Claude begins processing immediately. The session ID
+    /// is captured from stdout events via handle_event.
+    pub async fn spawn(payload: Payload) -> Result<(Self, EventReceiver), std::io::Error> {
+        let session_id = payload.session_id.clone();
 
-        let mut cmd = Command::new("claude");
-        cmd.arg("--print")
-            .arg("--input-format").arg("stream-json")
-            .arg("--output-format").arg("stream-json")
-            .arg("--replay-user-messages")
-            .arg("--verbose")
-            .arg("--max-thinking-tokens").arg("31999")
-            .arg("--resume").arg(&resume_arg);
-
-        if let Some(ref m) = model {
-            cmd.arg("--model").arg(m);
-        }
-
-        for dir in add_dirs {
-            cmd.arg("--add-dir").arg(dir);
-        }
-
+        let mut cmd = Command::new("easement");
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
 
         let mut child = cmd.spawn()?;
 
-        let stdin = child.stdin.take();
+        let mut stdin = child.stdin.take()
+            .expect("stdin was set to piped but take() returned None");
         let stdout = child.stdout.take()
             .expect("stdout was set to piped but take() returned None");
 
-        // Spawn the stdout reader task. It reads lines, parses NDJSON, and
-        // sends events through the channel. This matches the pattern in main.rs
-        // where the tailer and run_claude_print both use tokio::spawn with mpsc.
-        //
-        // The channel buffer is 256 — same as the tailer channel. Events arrive
-        // at the rate the CLI produces them, which is bounded by API response
-        // time and tool execution. 256 is generous.
-        let (tx, rx) = mpsc::channel::<StdoutEvent>(256);
+        // Write the payload as the first line. Everything after is the
+        // NDJSON message stream passed through to Claude.
+        let mut payload_line = serde_json::to_string(&payload)
+            .expect("Payload serialization cannot fail");
+        payload_line.push('\n');
+        stdin.write_all(payload_line.as_bytes()).await?;
+        stdin.flush().await?;
+
+        // Spawn the envelope reader task. Stdout envelopes drive the drain
+        // gate. Transcript envelopes feed the UI — Puzzle does not touch
+        // Claude's filesystem, the transcript comes through the envelope
+        // stream. Meta and error envelopes are logged.
+        let (tx, rx) = mpsc::channel::<EasementEvent>(256);
 
         tokio::spawn(async move {
             let reader = BufReader::new(stdout);
@@ -311,55 +210,72 @@ impl Invocation {
                     continue;
                 }
 
-                match serde_json::from_str::<StdoutEvent>(&line) {
-                    Ok(event) => {
-                        if tx.send(event).await.is_err() {
-                            // receiver dropped, main loop is done with us
+                let envelope: Envelope = match serde_json::from_str(&line) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::warn!(
+                            "envelope parse error: {} — line: {}",
+                            e,
+                            &line[..line.len().min(200)]
+                        );
+                        continue;
+                    }
+                };
+
+                match envelope.stream.as_str() {
+                    "stdout" => {
+                        match serde_json::from_value::<StdoutEvent>(envelope.data) {
+                            Ok(event) => {
+                                if tx.send(EasementEvent::Stdout(event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("stdout event parse error: {}", e);
+                            }
+                        }
+                    }
+                    "transcript" => {
+                        if tx.send(EasementEvent::Transcript(envelope.data)).await.is_err() {
                             break;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("stdout parse error: {} — line: {}", e, &line[..line.len().min(200)]);
+                    "meta" => {
+                        tracing::debug!("easement meta: {}", envelope.data);
+                    }
+                    "error" => {
+                        let msg = envelope.data.get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown error");
+                        tracing::error!("easement error: {}", msg);
+                    }
+                    other => {
+                        tracing::warn!("unknown envelope stream: {}", other);
                     }
                 }
             }
-            // stdout closed means child exited or pipe broke. the task ends.
-            // the channel drops. the main loop sees None from rx.recv().
         });
 
-        // if resuming by session ID, we already know it. if resuming by
-        // file path, the CLI generates a new one and we'll capture it from
-        // the first stdout event in handle_event.
-        let session_id = match target {
-            ResumeTarget::SessionId(id) => Some(id),
-            ResumeTarget::FilePath(_) => None,
-        };
-
+        // sent starts at 1 because the payload's kickoff message is sent
+        // by Easement to Claude on our behalf. With --replay-user-messages,
+        // it appears on stdout as isReplay: true, incrementing replayed.
+        // The drain gate needs sent == replayed to match at the result
+        // boundary, so the kickoff counts as a sent message.
         Ok((
             Self {
                 child,
-                stdin,
-                sent: 0,
+                stdin: Some(stdin),
+                sent: 1,
                 replayed: 0,
                 drained: false,
                 session_id,
-                model,
             },
             rx,
         ))
     }
 
-    /// Write a user message to the child's stdin. This is what starts a round
-    /// or injects a message into an ongoing round. The message is serialized as
-    /// NDJSON with a trailing newline. Sent count increments.
-    ///
-    /// If the round is idle (after a result event), this message starts a new
-    /// round. If a round is in progress, this message is queued by the CLI and
-    /// absorbed into the current round — it appears on the next API call within
-    /// the round. Claude sees it but it doesn't create a separate result event.
-    ///
-    /// Panics if called after drain or shutdown. The invocation is over.
-    /// Create a new one.
+    /// Write a user message to stdin. Easement passes it through to Claude.
+    /// This is for subsequent messages after the kickoff in the payload.
     pub async fn send(&mut self, content: &str) -> Result<(), std::io::Error> {
         assert!(!self.drained, "send() called after drain — invocation is over");
 
@@ -386,9 +302,7 @@ impl Invocation {
         Ok(())
     }
 
-    /// Send an interrupt. Cancels the current turn. After the turn unwinds,
-    /// the CLI processes the next queued command. Use this for urgent
-    /// intervention: interrupt, then send a user message with the warning.
+    /// Send an interrupt. Cancels the current turn.
     pub async fn interrupt(&mut self) -> Result<(), std::io::Error> {
         let stdin = self.stdin.as_mut()
             .expect("interrupt() called after shutdown");
@@ -409,8 +323,7 @@ impl Invocation {
         Ok(())
     }
 
-    /// Send a keep-alive heartbeat. The CLI accepts and ignores it. Use during
-    /// long idle periods to keep the pipe active.
+    /// Send a keep-alive heartbeat.
     pub async fn keep_alive(&mut self) -> Result<(), std::io::Error> {
         let stdin = self.stdin.as_mut()
             .expect("keep_alive() called after shutdown");
@@ -424,49 +337,16 @@ impl Invocation {
         Ok(())
     }
 
-    /// Close stdin and wait for the child to exit. This is the shutdown
-    /// sequence. Closing stdin sends EOF to the CLI's NDJSON parser. The
-    /// parser's for-await loop ends. Active turns complete before shutdown.
-    /// The transcript is flushed to disk.
-    ///
-    /// Only call this after the result event has arrived and nothing is queued
-    /// on Puzzle's side. Closing stdin while a turn is in progress kills the
-    /// turn. Closing stdin while an approval is pending causes the permission
-    /// to be denied (EOF rejects pending permission requests on the structured
-    /// input stream).
-    ///
-    /// After this call, the invocation is over. The struct should be dropped.
-    /// Create a new Invocation with --resume for the next round.
+    /// Close stdin and wait for the child to exit.
     pub async fn shutdown(mut self) -> Result<std::process::ExitStatus, std::io::Error> {
-        // Drop stdin to close the write end of the pipe. The child sees EOF.
         self.stdin.take();
-
-        // Wait for the child to exit. It will finish any active turn first,
-        // run cleanup callbacks, flush the transcript writer, and exit.
         self.child.wait().await
     }
 
-    /// Process an event from the stdout channel. The main loop calls this for
-    /// every event it pulls from the receiver. This is the adapter — the main
-    /// loop doesn't interpret events for counting purposes, it passes them
-    /// through and the struct updates its own state.
-    ///
-    /// Session ID capture: every stdout event carries a session_id. On the
-    /// first event that has one, the Invocation stores it. For session ID
-    /// resumes this confirms what we already knew. For file path resumes
-    /// (forks), this is how the caller discovers the new session identity.
-    ///
-    /// The drain gate: when a result event arrives, check if sent == replayed.
-    /// If they match, every message has been consumed. Flip drained to true.
-    /// No more sends are accepted. The main loop should call shutdown().
-    ///
-    /// If sent != replayed at result time, some messages are still in flight.
-    /// They'll trigger another round. Wait for the next result.
-    ///
-    /// Returns true if the invocation just drained (the gate flipped on this
-    /// event). The main loop can use this to trigger shutdown.
+    /// Process an event from the stdout channel. Updates drain gate state
+    /// and captures the session ID. Returns true if the invocation just
+    /// drained (sent == replayed at a result boundary).
     pub fn handle_event(&mut self, event: &StdoutEvent) -> bool {
-        // capture session_id from the first event that carries one.
         if self.session_id.is_none() {
             let event_session_id = match event {
                 StdoutEvent::System { session_id, .. } => session_id.as_ref(),
@@ -495,26 +375,18 @@ impl Invocation {
         false
     }
 
-    /// Whether the invocation has drained. Sent == replayed at a result
-    /// boundary. No more sends accepted. Shutdown is safe.
     pub fn is_drained(&self) -> bool {
         self.drained
     }
 
-    /// How many user messages have been written to stdin via send().
     pub fn sent(&self) -> u64 {
         self.sent
     }
 
-    /// How many isReplay user messages have appeared on stdout.
     pub fn replayed(&self) -> u64 {
         self.replayed
     }
 
-    /// The session ID for this invocation. Captured from the first stdout
-    /// event that carries one. For session ID resumes, this is the same ID
-    /// that was passed in. For file path resumes (forks), this is the new
-    /// UUID the CLI generated. Always available after the first event.
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
