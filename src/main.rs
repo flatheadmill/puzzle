@@ -47,7 +47,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::{App, Mode, RunState};
-use crate::claude::{EasementEvent, EventReceiver, Invocation, Payload, StdoutEvent};
+use crate::claude::{EasementEvent, EventReceiver, Invocation, Payload, SpawnTarget, StdoutEvent};
 use crate::model::{try_convert, ContentBlock, EntryKind};
 use crate::parser::parse_line;
 use crate::render::render_entry;
@@ -237,6 +237,14 @@ async fn main() -> Result<()> {
     let puzzle_state_dir: PathBuf;
     let viewer_path: Option<PathBuf>;
     let mut transcript: Option<Transcript> = None;
+    // Local and remote targets maintain separate sessions. The local session
+    // persists to sessions.jsonl and survives window restarts. The remote
+    // session lives only in memory — when the window dies, the remote session
+    // is abandoned and the next window will do a fresh transcript transfer.
+    // This is fine because the official transcript is the portable artifact,
+    // not the remote session.
+    let mut target = SpawnTarget::Local;
+    let mut yolo_session_id: Option<String> = None;
 
     if repl_mode {
         let s = positional.clone();
@@ -359,13 +367,22 @@ async fn main() -> Result<()> {
                     // widget and manages its own cursor. The block and style
                     // are set dynamically each frame based on mode and run state.
                     if let Some(input_rect) = input_area {
+                        let target_suffix = match app.target_label {
+                            Some(label) => format!(" [{}] ", label),
+                            None => String::new(),
+                        };
                         let title = match (&app.mode, &app.run_state) {
-                            (_, RunState::Running) => " running... ",
-                            (Mode::Input, RunState::Idle) => " prompt (esc: scroll) ",
-                            (Mode::Scroll, RunState::Idle) => " scroll (i: input) ",
+                            (_, RunState::Running) => format!(" running...{}", target_suffix),
+                            (Mode::Input, RunState::Idle) => format!(" prompt (esc: scroll){}", target_suffix),
+                            (Mode::Scroll, RunState::Idle) => format!(" scroll (i: input){}", target_suffix),
                         };
 
-                        let border_style = if app.mode == Mode::Input && app.run_state == RunState::Idle {
+                        // Yellow border when targeting a remote machine so it is
+                        // impossible to miss that you are running on someone else's
+                        // filesystem. Cyan for normal local input, gray otherwise.
+                        let border_style = if app.target_label.is_some() {
+                            Style::default().fg(Color::Yellow)
+                        } else if app.mode == Mode::Input && app.run_state == RunState::Idle {
                             Style::default().fg(Color::Cyan)
                         } else {
                             Style::default().fg(Color::DarkGray)
@@ -397,11 +414,13 @@ async fn main() -> Result<()> {
                     Some(EasementEvent::Stdout(stdout_event)) => {
                         if let Some(ref mut inv) = invocation {
                             // Capture the first assistant message UUID as the
-                            // boundary for transcript deduplication.
-                            if let StdoutEvent::Assistant { ref message, .. } = stdout_event {
+                            // boundary for transcript deduplication. The uuid
+                            // lives at the top level of the event, not inside
+                            // the message object.
+                            if let StdoutEvent::Assistant { ref uuid, .. } = stdout_event {
                                 if let Some(ref mut t) = transcript {
-                                    if let Some(uuid) = message.get("uuid").and_then(|v| v.as_str()) {
-                                        let new_entries = t.set_boundary(uuid.to_string());
+                                    if let Some(uuid) = uuid {
+                                        let new_entries = t.set_boundary(uuid.clone());
                                         for entry in new_entries {
                                             app.push_entry(entry);
                                         }
@@ -411,27 +430,41 @@ async fn main() -> Result<()> {
 
                             let drained = inv.handle_event(&stdout_event);
 
-                            // On first session ID capture from a bootstrap,
-                            // record the session.
-                            if session_id.is_none() {
-                                if let Some(sid) = inv.session_id() {
-                                    if let Some(ref s) = slug {
-                                        let _ = sessions::record_session(&puzzle_state_dir, s, sid);
+                            // Capture the session ID for the active target.
+                            // Local sessions get recorded to disk for persistence
+                            // across window restarts. Remote sessions are held in
+                            // memory for the window's lifetime.
+                            if let Some(sid) = inv.session_id() {
+                                match &target {
+                                    SpawnTarget::Local => {
+                                        if session_id.is_none() {
+                                            if let Some(ref s) = slug {
+                                                let _ = sessions::record_session(&puzzle_state_dir, s, sid);
+                                            }
+                                        }
+                                        session_id = Some(sid.to_string());
                                     }
-                                    session_id = Some(sid.to_string());
+                                    SpawnTarget::Remote { .. } => {
+                                        yolo_session_id = Some(sid.to_string());
+                                    }
                                 }
                             }
 
                             if drained {
                                 if let Some(sid) = inv.session_id() {
-                                    session_id = Some(sid.to_string());
+                                    tracing::info!(session_id = %sid, target = ?target, "invocation drained");
                                 }
+                                // Shut down Easement (close stdin, wait for
+                                // exit) but keep the channel alive. Transcript
+                                // envelopes arrive after stdout events — the
+                                // reader task will deliver them and then close
+                                // the channel when Easement's stdout hits EOF.
                                 let inv = invocation.take().unwrap();
                                 let _ = inv.shutdown().await;
-                                claude_rx = None;
                                 app.run_state = RunState::Idle;
                                 app.mode = Mode::Input;
                                 app.follow = true;
+                                tracing::info!("invocation drained, draining channel");
                             }
                         }
                     }
@@ -456,16 +489,22 @@ async fn main() -> Result<()> {
                         }
                     }
                     None => {
+                        // Channel closed — reader task finished. Normal
+                        // after drain. If the invocation is still alive
+                        // it means Easement died unexpectedly.
                         if let Some(inv) = invocation.take() {
+                            tracing::warn!("easement channel closed with invocation still active");
                             if let Some(sid) = inv.session_id() {
                                 session_id = Some(sid.to_string());
                             }
                             let _ = inv.shutdown().await;
+                            app.run_state = RunState::Idle;
+                            app.mode = Mode::Input;
+                            app.follow = true;
+                        } else {
+                            tracing::info!("channel closed, invocation complete");
                         }
                         claude_rx = None;
-                        app.run_state = RunState::Idle;
-                        app.mode = Mode::Input;
-                        app.follow = true;
                     }
                 }
             }
@@ -478,25 +517,74 @@ async fn main() -> Result<()> {
                             && key.code == KeyCode::Enter
                         {
                             if let Some(prompt) = app.submit_input() {
+                                // Slash commands switch the spawn target, not the
+                                // session. Nothing happens until the next prompt —
+                                // the target just determines where that prompt runs.
+                                // /yolo switches to ssh yolo@orb with dangerously-
+                                // skip-permissions. /mac switches back to local.
+                                // Repeating the current target is a no-op.
+                                let trimmed = prompt.trim();
+                                if trimmed == "/yolo" {
+                                    let new_target = SpawnTarget::Remote {
+                                        host: "yolo@orb".to_string(),
+                                    };
+                                    if target != new_target {
+                                        target = new_target;
+                                        app.target_label = Some("yolo");
+                                        tracing::info!("target switched to yolo@orb");
+                                    }
+                                    continue;
+                                } else if trimmed == "/mac" {
+                                    if target != SpawnTarget::Local {
+                                        target = SpawnTarget::Local;
+                                        app.target_label = None;
+                                        tracing::info!("target switched to local");
+                                    }
+                                    continue;
+                                }
+
+                                tracing::info!(
+                                    prompt_len = prompt.len(),
+                                    has_session = session_id.is_some(),
+                                    target = ?target,
+                                    "prompt submitted"
+                                );
                                 if let Some(ref s) = slug {
                                     if let Some(ref mut t) = transcript {
                                         t.begin_spurt();
                                     }
 
+                                    // Pick the session ID for the current target.
+                                    // Remote targets track their own session because
+                                    // --print mode always forks into a new session ID.
+                                    // The yolo flag maps to --dangerously-skip-permissions
+                                    // in Easement — the VM sandbox is the permission.
+                                    let (active_session, is_yolo) = match &target {
+                                        SpawnTarget::Local => (session_id.clone(), false),
+                                        SpawnTarget::Remote { .. } => (yolo_session_id.clone(), true),
+                                    };
+
                                     let payload = Payload {
                                         slug: s.clone(),
-                                        yolo: false,
+                                        yolo: is_yolo,
                                         message: prompt,
-                                        session_id: session_id.clone(),
-                                        transcript: if session_id.is_none() {
-                                            Some(vec![])
+                                        session_id: active_session.clone(),
+                                        transcript: if active_session.is_none() {
+                                            // First spurt on this target. Send the official
+                                            // transcript so Claude forks from it.
+                                            Some(
+                                                transcript.as_ref()
+                                                    .map(|t| t.entries().to_vec())
+                                                    .unwrap_or_default()
+                                            )
                                         } else {
                                             None
                                         },
                                     };
 
-                                    match Invocation::spawn(payload).await {
+                                    match Invocation::spawn(&target, payload).await {
                                         Ok((inv, erx)) => {
+                                            tracing::info!("easement spawned");
                                             invocation = Some(inv);
                                             claude_rx = Some(erx);
                                         }

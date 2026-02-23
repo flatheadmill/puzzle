@@ -42,6 +42,10 @@ pub struct App {
     pub run_state: RunState,
     pub textarea: TextArea<'static>,
     pub repl_mode: bool,
+    /// Shown in the prompt bar when a remote target is active. The border
+    /// goes yellow and the label appears as [yolo] so the operator always
+    /// knows where the next prompt will run.
+    pub target_label: Option<&'static str>,
 }
 
 fn new_textarea() -> TextArea<'static> {
@@ -64,10 +68,21 @@ impl App {
             run_state: RunState::Idle,
             textarea: new_textarea(),
             repl_mode,
+            target_label: None,
         }
     }
 
     pub fn push_entry(&mut self, entry: ConversationEntry) {
+        let block_count = entry.blocks.len();
+        let kind = match entry.kind {
+            crate::model::EntryKind::User => "user",
+            crate::model::EntryKind::Assistant => "assistant",
+        };
+        tracing::info!(
+            kind, blocks = block_count,
+            total = self.entries.len() + 1,
+            "push_entry to UI"
+        );
         self.entries.push(entry);
         if self.follow {
             self.scroll_to_bottom();

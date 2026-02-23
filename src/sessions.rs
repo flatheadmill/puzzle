@@ -30,6 +30,7 @@ pub fn sessions_path(config_dir: &Path, slug: &str) -> PathBuf {
 
 /// Derive the slug from a pane directory path. Strips the ~/pane/ prefix and
 /// returns the remaining path component. For ~/pane/puzzle, returns "puzzle".
+#[allow(dead_code)]
 pub fn slug_from_pane_dir(pane_dir: &Path) -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let pane_root = PathBuf::from(&home).join("pane");
@@ -75,6 +76,7 @@ pub fn record_session(
 }
 
 /// Read all session IDs for a slug, most recent last.
+#[allow(dead_code)]
 pub fn all_sessions(config_dir: &Path, slug: &str) -> Vec<SessionEntry> {
     let path = sessions_path(config_dir, slug);
     let file = match fs::File::open(&path) {

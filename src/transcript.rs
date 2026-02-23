@@ -46,11 +46,21 @@ impl Transcript {
         self.boundary_uuid = None;
         self.boundary_found = self.entries.is_empty();
         self.buffer.clear();
+        tracing::info!(
+            entries = self.entries.len(),
+            boundary_found = self.boundary_found,
+            "begin spurt (first={})", self.entries.is_empty()
+        );
     }
 
     /// Set the boundary UUID from the first assistant stdout event.
     /// Processes any buffered envelopes and returns new UI entries.
     pub fn set_boundary(&mut self, uuid: String) -> Vec<ConversationEntry> {
+        tracing::info!(
+            uuid = %uuid,
+            buffered = self.buffer.len(),
+            "boundary uuid set"
+        );
         self.boundary_uuid = Some(uuid);
         self.process_buffer()
     }
@@ -59,11 +69,23 @@ impl Transcript {
     /// if the envelope contains new content (past the boundary or first
     /// spurt).
     pub fn handle_envelope(&mut self, data: serde_json::Value) -> Vec<ConversationEntry> {
+        let entry_type = data.get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
         if self.boundary_found {
+            tracing::debug!(entry_type = %entry_type, entries = self.entries.len(), "accepting transcript entry");
             return self.accept(data);
         }
 
         self.buffer.push(data);
+        tracing::debug!(
+            entry_type = %entry_type,
+            buffered = self.buffer.len(),
+            has_boundary = self.boundary_uuid.is_some(),
+            "buffering transcript entry"
+        );
 
         if self.boundary_uuid.is_some() {
             return self.process_buffer();
@@ -73,8 +95,18 @@ impl Transcript {
     }
 
     /// Number of entries in the official transcript.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// The raw entries for transcript transfer in the Easement payload.
+    /// When migrating to a new machine for the first time, Puzzle sends
+    /// these as the transcript array. Easement writes them to a temp file,
+    /// Claude forks from it into a new session. Message UUIDs are stable
+    /// across forks (cli.js:497615), so deduplication still works.
+    pub fn entries(&self) -> &[serde_json::Value] {
+        &self.entries
     }
 
     fn accept(&mut self, data: serde_json::Value) -> Vec<ConversationEntry> {
@@ -97,22 +129,53 @@ impl Transcript {
             None => return vec![],
         };
 
+        // Find the boundary entry in the buffer.
+        let boundary_pos = self.buffer.iter().position(|data| {
+            data.get("uuid").and_then(|v| v.as_str()) == Some(uuid.as_str())
+        });
+
+        let boundary_pos = match boundary_pos {
+            Some(pos) => pos,
+            None => {
+                // Boundary not found yet. Leave the buffer intact — the
+                // boundary entry hasn't arrived from the tailer yet.
+                tracing::debug!(
+                    buffered = self.buffer.len(),
+                    boundary_uuid = %uuid,
+                    "boundary not in buffer yet, waiting"
+                );
+                return vec![];
+            }
+        };
+
+        self.boundary_found = true;
+
+        // The new turn includes a user entry before the assistant boundary
+        // (the prompt that triggered the response). Scan backward to find
+        // it so the user message is included in the new content.
+        let start = self.buffer[..boundary_pos]
+            .iter()
+            .rposition(|data| {
+                data.get("type").and_then(|v| v.as_str()) == Some("user")
+            })
+            .unwrap_or(boundary_pos);
+
+        let skipped = start;
+        let new_content: Vec<_> = self.buffer.drain(start..).collect();
+        let accepted_count = new_content.len();
+        self.buffer.clear(); // discard history before the new content
+
+        tracing::info!(
+            skipped,
+            accepted = accepted_count,
+            total_buffered = skipped + accepted_count,
+            "boundary found, processing new content"
+        );
+
         let mut results = vec![];
-        let buffer = std::mem::take(&mut self.buffer);
-
-        for data in buffer {
-            if !self.boundary_found {
-                let entry_uuid = data.get("uuid").and_then(|v| v.as_str());
-                if entry_uuid == Some(uuid.as_str()) {
-                    self.boundary_found = true;
-                }
-            }
-
-            if self.boundary_found {
-                results.extend(self.accept(data));
-            }
+        for data in new_content {
+            results.extend(self.accept(data));
         }
-
         results
     }
 

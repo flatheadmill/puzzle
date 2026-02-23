@@ -8,6 +8,12 @@
 // for failures. Puzzle unwraps the stdout envelopes and parses the data
 // field into StdoutEvent for drain gate tracking.
 //
+// The SpawnTarget controls where Easement runs. Local spawns the binary
+// directly. Remote spawns it over SSH. The envelope protocol is identical
+// either way — SSH is just a transport. The first remote spurt sends the
+// official transcript in the payload so Claude can fork into a new session
+// on the remote machine. Subsequent remote spurts use the remote session ID.
+//
 // The struct IS the invocation — it is created, it runs, it drains, it is
 // dropped. The session state lives in the JSONL transcript on disk, not in
 // this struct. When the invocation is done, create a new one with the same
@@ -86,6 +92,7 @@ pub enum StdoutEvent {
     Assistant {
         message: serde_json::Value,
         session_id: Option<String>,
+        uuid: Option<String>,
     },
 
     /// User messages on stdout. With --replay-user-messages, injected
@@ -145,6 +152,21 @@ struct KeepAlive {
     r#type: &'static str,
 }
 
+// -- Spawn target --
+//
+// From Puzzle's perspective, local and remote are the same spawn with a
+// different command. Local runs `easement` directly. Remote runs
+// `ssh <host> easement` — SSH tunnels stdin/stdout transparently so the
+// envelope protocol works identically. The host is expected to have
+// Easement and Claude installed in the user's home directory. Puzzle does
+// not manage the remote environment.
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SpawnTarget {
+    Local,
+    Remote { host: String },
+}
+
 // -- The invocation --
 
 #[allow(dead_code)]
@@ -168,13 +190,29 @@ pub type EventReceiver = mpsc::Receiver<EasementEvent>;
 
 #[allow(dead_code)]
 impl Invocation {
-    /// Spawn Easement with a payload. The payload includes the kickoff
-    /// message, so Claude begins processing immediately. The session ID
-    /// is captured from stdout events via handle_event.
-    pub async fn spawn(payload: Payload) -> Result<(Self, EventReceiver), std::io::Error> {
+    /// Spawn Easement with a payload. The target controls whether Easement
+    /// runs locally or over SSH. The payload includes the kickoff message,
+    /// so Claude begins processing immediately. The session ID is captured
+    /// from stdout events via handle_event.
+    pub async fn spawn(target: &SpawnTarget, payload: Payload) -> Result<(Self, EventReceiver), std::io::Error> {
         let session_id = payload.session_id.clone();
 
-        let mut cmd = Command::new("easement");
+        tracing::info!(
+            slug = %payload.slug,
+            has_session_id = session_id.is_some(),
+            has_transcript = payload.transcript.is_some(),
+            target = ?target,
+            "spawning easement"
+        );
+
+        let mut cmd = match target {
+            SpawnTarget::Local => Command::new("easement"),
+            SpawnTarget::Remote { host } => {
+                let mut c = Command::new("ssh");
+                c.arg(host).arg("easement");
+                c
+            }
+        };
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -226,7 +264,18 @@ impl Invocation {
                     "stdout" => {
                         match serde_json::from_value::<StdoutEvent>(envelope.data) {
                             Ok(event) => {
+                                let event_desc = match &event {
+                                    StdoutEvent::Result { .. } => "result",
+                                    StdoutEvent::System { .. } => "system",
+                                    StdoutEvent::Assistant { .. } => "assistant",
+                                    StdoutEvent::User { is_replay, .. } =>
+                                        if *is_replay { "user(replay)" } else { "user" },
+                                    StdoutEvent::RateLimitEvent { .. } => "rate_limit",
+                                    StdoutEvent::Unknown => "unknown",
+                                };
+                                tracing::debug!(event = event_desc, "stdout event received");
                                 if tx.send(EasementEvent::Stdout(event)).await.is_err() {
+                                    tracing::warn!("event channel closed");
                                     break;
                                 }
                             }
@@ -236,12 +285,17 @@ impl Invocation {
                         }
                     }
                     "transcript" => {
+                        let entry_type = envelope.data.get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        tracing::debug!(entry_type, "transcript envelope received");
                         if tx.send(EasementEvent::Transcript(envelope.data)).await.is_err() {
+                            tracing::warn!("event channel closed");
                             break;
                         }
                     }
                     "meta" => {
-                        tracing::debug!("easement meta: {}", envelope.data);
+                        tracing::info!("easement meta: {}", envelope.data);
                     }
                     "error" => {
                         let msg = envelope.data.get("message")
@@ -299,6 +353,7 @@ impl Invocation {
         stdin.flush().await?;
 
         self.sent += 1;
+        tracing::info!(sent = self.sent, "message sent to easement");
         Ok(())
     }
 
@@ -339,8 +394,14 @@ impl Invocation {
 
     /// Close stdin and wait for the child to exit.
     pub async fn shutdown(mut self) -> Result<std::process::ExitStatus, std::io::Error> {
+        tracing::info!(
+            sent = self.sent, replayed = self.replayed, drained = self.drained,
+            "shutting down easement"
+        );
         self.stdin.take();
-        self.child.wait().await
+        let status = self.child.wait().await;
+        tracing::info!(?status, "easement exited");
+        status
     }
 
     /// Process an event from the stdout channel. Updates drain gate state
@@ -356,6 +417,7 @@ impl Invocation {
                 _ => None,
             };
             if let Some(id) = event_session_id {
+                tracing::info!(session_id = %id, "captured session id");
                 self.session_id = Some(id.clone());
             }
         }
@@ -363,8 +425,19 @@ impl Invocation {
         match event {
             StdoutEvent::User { is_replay: true, .. } => {
                 self.replayed += 1;
+                tracing::debug!(
+                    sent = self.sent, replayed = self.replayed,
+                    "user replay, drain gate: {}/{}",
+                    self.replayed, self.sent
+                );
             }
             StdoutEvent::Result { .. } => {
+                tracing::info!(
+                    sent = self.sent, replayed = self.replayed,
+                    drained = (self.sent == self.replayed),
+                    "result event, drain gate: {}/{}",
+                    self.replayed, self.sent
+                );
                 if self.sent == self.replayed {
                     self.drained = true;
                     return true;
