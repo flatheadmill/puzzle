@@ -36,17 +36,20 @@ use std::time::Duration;
 use color_eyre::eyre::{bail, Result};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use futures::StreamExt;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::text::Text;
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Wrap,
 };
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
-use crate::app::{App, Mode, RunState};
+use crate::app::{App, ApprovalDecision, Mode, PendingApproval, RunState};
 use crate::claude::{EasementEvent, EventReceiver, Invocation, Payload, SpawnTarget, StdoutEvent};
 use crate::model::{try_convert, ContentBlock, EntryKind};
 use crate::parser::parse_line;
@@ -143,6 +146,28 @@ async fn recv_easement(rx: &mut Option<EventReceiver>) -> Option<EasementEvent> 
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// Accepts the next connection on the Wicket socket, or pends forever if
+/// no listener is bound. Used as a select! arm that disables itself in
+/// viewer mode or if the bind failed.
+async fn accept_wicket(
+    listener: &Option<UnixListener>,
+) -> std::io::Result<tokio::net::UnixStream> {
+    match listener {
+        Some(l) => l.accept().await.map(|(stream, _)| stream),
+        None => std::future::pending().await,
+    }
+}
+
+/// Computes a centered rectangle within `area` with the given width and
+/// height constraints, clamped to the available space.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect::new(x, y, w, h)
 }
 
 /// Format a timestamp for the window directory name. Uses the same style
@@ -311,6 +336,30 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Wicket socket listener. In REPL mode, bind the socket so Wicket can
+    // relay approval requests. Remove a stale socket file if one exists
+    // from a previous run. The listener persists across spurts — Puzzle
+    // binds once at startup and accepts connections as they arrive.
+    let wicket_socket_path = "/tmp/wicket.sock";
+    let wicket_listener = if repl_mode {
+        let _ = std::fs::remove_file(wicket_socket_path);
+        match UnixListener::bind(wicket_socket_path) {
+            Ok(l) => {
+                tracing::info!("wicket socket listener bound at {}", wicket_socket_path);
+                Some(l)
+            }
+            Err(e) => {
+                tracing::error!("failed to bind wicket socket: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Write half of the active Wicket connection. Held here so the event
+    // loop can write the approval response when the operator decides.
+    let mut wicket_writer: Option<tokio::net::unix::OwnedWriteHalf> = None;
+
     let mut terminal = ratatui::init();
     let mut app = App::new(repl_mode);
     let mut events = EventStream::new();
@@ -403,6 +452,59 @@ async fn main() -> Result<()> {
                         app.textarea.set_style(text_style);
 
                         frame.render_widget(&app.textarea, input_rect);
+                    }
+
+                    // Approval dialog overlay. Rendered last so it appears
+                    // on top of everything else.
+                    if let Some(ref approval) = app.pending_approval {
+                        let popup_area = centered_rect(area, 60, 16);
+                        frame.render_widget(Clear, popup_area);
+
+                        let mut lines: Vec<Line> = vec![
+                            Line::from(""),
+                            Line::from(vec![
+                                Span::styled("  Tool: ", Style::default().fg(Color::DarkGray)),
+                                Span::styled(
+                                    approval.tool_name.clone(),
+                                    Style::default().fg(Color::Yellow),
+                                ),
+                            ]),
+                            Line::from(""),
+                        ];
+
+                        // Show a few lines of the input summary.
+                        for line in approval.input_summary.lines().take(8) {
+                            lines.push(Line::from(Span::styled(
+                                format!("  {}", line),
+                                Style::default().fg(Color::White),
+                            )));
+                        }
+                        let total_lines = approval.input_summary.lines().count();
+                        if total_lines > 8 {
+                            lines.push(Line::from(Span::styled(
+                                format!("  ... ({} more lines)", total_lines - 8),
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        }
+
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(vec![
+                            Span::styled("  [y] ", Style::default().fg(Color::Green)),
+                            Span::styled("Allow  ", Style::default().fg(Color::White)),
+                            Span::styled("[n] ", Style::default().fg(Color::Red)),
+                            Span::styled("Deny", Style::default().fg(Color::White)),
+                        ]));
+
+                        let dialog = Paragraph::new(lines)
+                            .block(
+                                Block::default()
+                                    .borders(Borders::ALL)
+                                    .title(" Approve? ")
+                                    .border_style(Style::default().fg(Color::Yellow)),
+                            )
+                            .wrap(Wrap { trim: false });
+
+                        frame.render_widget(dialog, popup_area);
                     }
                 })?;
             }
@@ -508,11 +610,49 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            Ok(stream) = accept_wicket(&wicket_listener), if app.pending_approval.is_none() => {
+                // Read the approval request — a single JSON line. The request
+                // arrives immediately after connection so this doesn't block
+                // the event loop in practice.
+                let (reader, writer) = stream.into_split();
+                let mut buf_reader = BufReader::new(reader);
+                let mut line = String::new();
+                match buf_reader.read_line(&mut line).await {
+                    Ok(0) => {
+                        tracing::warn!("wicket connection closed before sending request");
+                    }
+                    Ok(_) => {
+                        if let Ok(request) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                            let tool_name = request.get("tool_name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let input = request.get("input")
+                                .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
+                                .unwrap_or_default();
+                            tracing::info!(tool = %tool_name, "approval request received");
+                            app.pending_approval = Some(PendingApproval {
+                                tool_name,
+                                input_summary: input,
+                            });
+                            wicket_writer = Some(writer);
+                        } else {
+                            tracing::warn!("failed to parse wicket request: {}", line.trim());
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to read wicket request: {}", e);
+                    }
+                }
+            }
             Some(Ok(event)) = events.next() => {
                 if let Event::Key(key) = event {
                     if key.kind == KeyEventKind::Press {
-                        // check for Enter in input mode to submit
-                        if app.mode == Mode::Input
+                        // check for Enter in input mode to submit.
+                        // Skip when an approval dialog is visible — the
+                        // dialog handler in app.handle_key takes priority.
+                        if app.pending_approval.is_none()
+                            && app.mode == Mode::Input
                             && app.run_state == RunState::Idle
                             && key.code == KeyCode::Enter
                         {
@@ -606,9 +746,34 @@ async fn main() -> Result<()> {
             }
         }
 
+        // Handle approval decisions outside the select! so the write
+        // happens promptly after the key press, not on the next tick.
+        if let Some(decision) = app.approval_decision.take() {
+            if let Some(mut writer) = wicket_writer.take() {
+                let response = match decision {
+                    ApprovalDecision::Allow => {
+                        tracing::info!("approval: allow");
+                        "{\"behavior\":\"allow\"}\n"
+                    }
+                    ApprovalDecision::Deny => {
+                        tracing::info!("approval: deny");
+                        "{\"behavior\":\"deny\",\"message\":\"User denied permission\"}\n"
+                    }
+                };
+                let _ = writer.write_all(response.as_bytes()).await;
+                let _ = writer.flush().await;
+                let _ = writer.shutdown().await;
+            }
+        }
+
         if app.should_quit {
             break;
         }
+    }
+
+    // Clean up the wicket socket on exit.
+    if repl_mode {
+        let _ = std::fs::remove_file(wicket_socket_path);
     }
 
     ratatui::restore();

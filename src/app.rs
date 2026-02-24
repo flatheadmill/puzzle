@@ -33,6 +33,17 @@ pub enum RunState {
     Running,
 }
 
+/// An approval request from Wicket waiting for the operator's decision.
+pub struct PendingApproval {
+    pub tool_name: String,
+    pub input_summary: String,
+}
+
+pub enum ApprovalDecision {
+    Allow,
+    Deny,
+}
+
 pub struct App {
     pub entries: Vec<ConversationEntry>,
     pub list_state: ListState,
@@ -46,6 +57,11 @@ pub struct App {
     /// goes yellow and the label appears as [yolo] so the operator always
     /// knows where the next prompt will run.
     pub target_label: Option<&'static str>,
+    /// When set, an approval dialog is visible and keyboard input routes
+    /// to it instead of the normal handlers. The decision clears this and
+    /// sets approval_decision for the event loop to act on.
+    pub pending_approval: Option<PendingApproval>,
+    pub approval_decision: Option<ApprovalDecision>,
 }
 
 fn new_textarea() -> TextArea<'static> {
@@ -69,6 +85,8 @@ impl App {
             textarea: new_textarea(),
             repl_mode,
             target_label: None,
+            pending_approval: None,
+            approval_decision: None,
         }
     }
 
@@ -99,6 +117,21 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        // Approval dialog takes priority over all other input.
+        if self.pending_approval.is_some() {
+            match key.code {
+                KeyCode::Char('y') => {
+                    self.pending_approval = None;
+                    self.approval_decision = Some(ApprovalDecision::Allow);
+                }
+                KeyCode::Char('n') => {
+                    self.pending_approval = None;
+                    self.approval_decision = Some(ApprovalDecision::Deny);
+                }
+                _ => {}
+            }
+            return;
+        }
         match self.mode {
             Mode::Input => self.handle_input_key(key),
             Mode::Scroll => self.handle_scroll_key(key),
