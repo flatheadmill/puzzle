@@ -7,9 +7,10 @@
 // transcript entries feed the official transcript for deduplication and
 // persistence, then new entries push to the UI.
 //
-// The event loop is tokio::select! across four sources: a frame timer at 33ms,
+// The event loop is tokio::select! across five sources: a frame timer at 33ms,
 // the tailer channel (viewer mode only), the Easement event channel for stdout
-// and transcript envelopes, and crossterm's EventStream for keyboard input.
+// and transcript envelopes, the Wicket Unix socket for approval requests, and
+// crossterm's EventStream for keyboard input.
 //
 // State lives under ~/.local/state/puzzle/<slug>/ with sessions.jsonl for
 // session tracking and windows/<timestamp>/ directories for each window
@@ -356,8 +357,11 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    // Write half of the active Wicket connection. Held here so the event
-    // loop can write the approval response when the operator decides.
+    // The Wicket connection is split: the read half is consumed in the
+    // accept arm to parse the request, and the write half is stashed here
+    // until the operator presses y/n. The connection stays open across loop
+    // iterations — Wicket is blocking on the other end waiting for our
+    // response, which keeps Claude blocked too.
     let mut wicket_writer: Option<tokio::net::unix::OwnedWriteHalf> = None;
 
     let mut terminal = ratatui::init();
@@ -610,10 +614,13 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            // The select guard is the concurrency model. While an approval
+            // is pending, we stop accepting new connections entirely. This is
+            // why pending_approval and wicket_writer can both be simple Options
+            // rather than queues — there is never more than one in flight.
+            // Wicket holds the MCP connection open on its side, so Claude blocks
+            // until we respond. No races, no ordering concerns, no dropped requests.
             Ok(stream) = accept_wicket(&wicket_listener), if app.pending_approval.is_none() => {
-                // Read the approval request — a single JSON line. The request
-                // arrives immediately after connection so this doesn't block
-                // the event loop in practice.
                 let (reader, writer) = stream.into_split();
                 let mut buf_reader = BufReader::new(reader);
                 let mut line = String::new();
@@ -748,6 +755,12 @@ async fn main() -> Result<()> {
 
         // Handle approval decisions outside the select! so the write
         // happens promptly after the key press, not on the next tick.
+        //
+        // The response goes to Wicket over the Unix socket, not to Claude
+        // directly. Wicket constructs the full MCP tool response including
+        // updatedInput (which the CLI's Zod schema requires on allow) before
+        // relaying to Claude. Puzzle only needs behavior and an optional
+        // denial message.
         if let Some(decision) = app.approval_decision.take() {
             if let Some(mut writer) = wicket_writer.take() {
                 let response = match decision {
