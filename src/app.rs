@@ -54,9 +54,9 @@ pub struct App {
     pub textarea: TextArea<'static>,
     pub repl_mode: bool,
     /// Shown in the prompt bar when a remote target is active. The border
-    /// goes yellow and the label appears as [yolo] so the operator always
-    /// knows where the next prompt will run.
-    pub target_label: Option<&'static str>,
+    /// goes yellow and the label appears as [yolo] or [user@host] so the
+    /// operator always knows where the next prompt will run.
+    pub target_label: Option<String>,
     /// When set, an approval dialog is visible and keyboard input routes
     /// to it instead of the normal handlers. The decision clears this and
     /// sets approval_decision for the event loop to act on.

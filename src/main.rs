@@ -270,7 +270,7 @@ async fn main() -> Result<()> {
     // This is fine because the official transcript is the portable artifact,
     // not the remote session.
     let mut target = SpawnTarget::Local;
-    let mut yolo_session_id: Option<String> = None;
+    let mut remote_session_id: Option<String> = None;
 
     if repl_mode {
         let s = positional.clone();
@@ -337,16 +337,20 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Wicket socket listener. In REPL mode, bind the socket so Wicket can
-    // relay approval requests. Remove a stale socket file if one exists
-    // from a previous run. The listener persists across spurts — Puzzle
-    // binds once at startup and accepts connections as they arrive.
-    let wicket_socket_path = "/tmp/wicket.sock";
+    // Wicket socket listener. Binds in the pane directory so the path is
+    // naturally scoped by slug — no collisions between windows. Remove a
+    // stale socket file if one exists from a previous run. The listener
+    // persists across spurts — Puzzle binds once at startup and accepts
+    // connections as they arrive.
+    let wicket_socket_path = PathBuf::from(&home)
+        .join("pane")
+        .join(slug.as_ref().unwrap_or(&positional))
+        .join("wicket.sock");
     let wicket_listener = if repl_mode {
-        let _ = std::fs::remove_file(wicket_socket_path);
-        match UnixListener::bind(wicket_socket_path) {
+        let _ = std::fs::remove_file(&wicket_socket_path);
+        match UnixListener::bind(&wicket_socket_path) {
             Ok(l) => {
-                tracing::info!("wicket socket listener bound at {}", wicket_socket_path);
+                tracing::info!("wicket socket listener bound at {}", wicket_socket_path.display());
                 Some(l)
             }
             Err(e) => {
@@ -420,7 +424,7 @@ async fn main() -> Result<()> {
                     // widget and manages its own cursor. The block and style
                     // are set dynamically each frame based on mode and run state.
                     if let Some(input_rect) = input_area {
-                        let target_suffix = match app.target_label {
+                        let target_suffix = match &app.target_label {
                             Some(label) => format!(" [{}] ", label),
                             None => String::new(),
                         };
@@ -551,7 +555,7 @@ async fn main() -> Result<()> {
                                         session_id = Some(sid.to_string());
                                     }
                                     SpawnTarget::Remote { .. } => {
-                                        yolo_session_id = Some(sid.to_string());
+                                        remote_session_id = Some(sid.to_string());
                                     }
                                 }
                             }
@@ -674,11 +678,24 @@ async fn main() -> Result<()> {
                                 if trimmed == "/yolo" {
                                     let new_target = SpawnTarget::Remote {
                                         host: "yolo@orb".to_string(),
+                                        yolo: true,
                                     };
                                     if target != new_target {
                                         target = new_target;
-                                        app.target_label = Some("yolo");
+                                        app.target_label = Some("yolo".to_string());
                                         tracing::info!("target switched to yolo@orb");
+                                    }
+                                    continue;
+                                } else if let Some(host) = trimmed.strip_prefix("/remote ") {
+                                    let host = host.trim().to_string();
+                                    let new_target = SpawnTarget::Remote {
+                                        host: host.clone(),
+                                        yolo: false,
+                                    };
+                                    if target != new_target {
+                                        app.target_label = Some(host.clone());
+                                        tracing::info!("target switched to {}", host);
+                                        target = new_target;
                                     }
                                     continue;
                                 } else if trimmed == "/mac" {
@@ -708,7 +725,7 @@ async fn main() -> Result<()> {
                                     // in Easement — the VM sandbox is the permission.
                                     let (active_session, is_yolo) = match &target {
                                         SpawnTarget::Local => (session_id.clone(), false),
-                                        SpawnTarget::Remote { .. } => (yolo_session_id.clone(), true),
+                                        SpawnTarget::Remote { yolo, .. } => (remote_session_id.clone(), *yolo),
                                     };
 
                                     let payload = Payload {
@@ -727,6 +744,7 @@ async fn main() -> Result<()> {
                                         } else {
                                             None
                                         },
+                                        wicket_socket: None,
                                     };
 
                                     match Invocation::spawn(&target, payload).await {

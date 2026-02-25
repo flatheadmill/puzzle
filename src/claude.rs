@@ -56,6 +56,8 @@ pub struct Payload {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wicket_socket: Option<String>,
 }
 
 // -- Stdout event types --
@@ -164,7 +166,7 @@ struct KeepAlive {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SpawnTarget {
     Local,
-    Remote { host: String },
+    Remote { host: String, yolo: bool },
 }
 
 // -- The invocation --
@@ -194,7 +196,7 @@ impl Invocation {
     /// runs locally or over SSH. The payload includes the kickoff message,
     /// so Claude begins processing immediately. The session ID is captured
     /// from stdout events via handle_event.
-    pub async fn spawn(target: &SpawnTarget, payload: Payload) -> Result<(Self, EventReceiver), std::io::Error> {
+    pub async fn spawn(target: &SpawnTarget, mut payload: Payload) -> Result<(Self, EventReceiver), std::io::Error> {
         let session_id = payload.session_id.clone();
 
         tracing::info!(
@@ -207,8 +209,22 @@ impl Invocation {
 
         let mut cmd = match target {
             SpawnTarget::Local => Command::new("easement"),
-            SpawnTarget::Remote { host } => {
+            SpawnTarget::Remote { host, yolo } => {
                 let mut c = Command::new("ssh");
+                // Reverse tunnel the Wicket socket so approval requests from
+                // the remote machine reach Puzzle's local listener. The remote
+                // socket lives in /tmp because SSH -R binds the socket before
+                // the remote command runs — ~/pane/<slug>/ doesn't exist yet
+                // on the remote side. /tmp is always there, and the OS cleans
+                // stale sockets eventually.
+                if !yolo {
+                    let home = std::env::var("HOME").expect("HOME not set");
+                    let local_socket = format!("{}/pane/{}/wicket.sock", home, payload.slug);
+                    let short_id = &Uuid::new_v4().to_string()[..8];
+                    let remote_socket = format!("/tmp/puzzle-{}-{}.sock", payload.slug, short_id);
+                    payload.wicket_socket = Some(remote_socket.clone());
+                    c.arg("-R").arg(format!("{}:{}", remote_socket, local_socket));
+                }
                 c.arg(host).arg("easement");
                 c
             }
