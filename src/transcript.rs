@@ -94,6 +94,44 @@ impl Transcript {
         vec![]
     }
 
+    /// Load entries from a previous window's transcript. Populates
+    /// self.entries for dedup and persists each entry to the current
+    /// window's transcript.jsonl so it is self-contained. Returns
+    /// parsed ConversationEntry values for the UI.
+    pub fn load(&mut self, source: &std::path::Path) -> Vec<ConversationEntry> {
+        let content = match std::fs::read_to_string(source) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("failed to read previous transcript: {}", e);
+                return vec![];
+            }
+        };
+
+        let mut ui_entries = vec![];
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(data) => {
+                    ui_entries.extend(self.accept(data));
+                }
+                Err(e) => {
+                    tracing::warn!("transcript line parse error: {}", e);
+                }
+            }
+        }
+
+        tracing::info!(
+            loaded = self.entries.len(),
+            ui_entries = ui_entries.len(),
+            source = %source.display(),
+            "transcript loaded from previous window"
+        );
+        ui_entries
+    }
+
     /// Number of entries in the official transcript.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {

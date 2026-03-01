@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Puzzle</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,700;1,400&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #1e1e1e;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    color: rgb(200, 200, 195);
+    padding: 24px;
+  }
+
+  .terminal {
+    max-width: 120ch;
+    margin: 0 auto;
+    background: #1a1a1a;
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .conversation {
+    padding: 0;
+  }
+
+  .entry {
+    padding: 0 0 0 1ch;
+  }
+
+  .entry + .entry {
+    margin-top: 0;
+  }
+
+  .speaker {
+    color: rgb(100, 100, 105);
+    margin-bottom: 0;
+  }
+
+  .blank {
+    height: 1.5em;
+  }
+
+  .prose {
+    color: rgb(200, 200, 195);
+  }
+
+  .prose strong { font-weight: 700; }
+  .prose em { font-style: italic; }
+  .prose code {
+    color: rgb(150, 180, 140);
+  }
+
+  .heading {
+    color: rgb(200, 200, 195);
+    font-weight: 700;
+  }
+
+  .thinking {
+    color: rgb(65, 65, 70);
+    font-style: italic;
+  }
+
+  .thinking-gutter {
+    color: rgb(70, 100, 130);
+  }
+
+  .tool-use {
+    color: rgb(100, 100, 105);
+  }
+
+  .tool-summary {
+    color: rgb(65, 65, 70);
+    padding-left: 4ch;
+  }
+
+  .tool-result-header {
+    color: rgb(65, 65, 70);
+  }
+
+  .tool-result-expanded {
+    color: rgb(65, 65, 70);
+    padding-left: 4ch;
+  }
+
+  .tool-result-ansi {
+    padding-left: 4ch;
+  }
+
+  .error {
+    color: rgb(200, 100, 90);
+  }
+
+  .rule {
+    color: rgb(65, 65, 70);
+  }
+
+  .code-block {
+    color: rgb(175, 175, 170);
+  }
+
+  .input-area {
+    border: 1px solid rgb(100, 160, 200);
+    margin: 0 1ch;
+    padding: 4px 8px;
+    min-height: 3em;
+    position: relative;
+  }
+
+  .input-title {
+    position: absolute;
+    top: -0.75em;
+    left: 1ch;
+    background: #1a1a1a;
+    padding: 0 0.5ch;
+    color: rgb(100, 160, 200);
+    font-size: 12px;
+  }
+
+  .input-cursor {
+    display: inline-block;
+    width: 1ch;
+    height: 1.3em;
+    background: rgb(200, 200, 195);
+    vertical-align: text-bottom;
+  }
+
+  .input-area.remote {
+    border-color: rgb(210, 160, 60);
+  }
+
+  .input-area.remote .input-title {
+    color: rgb(210, 160, 60);
+  }
+
+  .input-area.idle {
+    border-color: rgb(65, 65, 70);
+  }
+
+  .input-area.idle .input-title {
+    color: rgb(65, 65, 70);
+  }
+
+  .scrollbar {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 3em;
+    width: 1ch;
+    background: #1a1a1a;
+  }
+
+  .scrollbar-thumb {
+    width: 1ch;
+    height: 20%;
+    background: rgb(65, 65, 70);
+    position: absolute;
+    bottom: 10%;
+  }
+</style>
+</head>
+<body>
+<div class="terminal">
+<div class="conversation">
+
+<!-- Human entry -->
+<div class="entry">
+  <div class="speaker">Human</div>
+  <div class="blank"></div>
+  <div class="prose">Let's start this off with a bang. Clear your head of all the rusty Rust and start to see what a contemporary terminal UI should be.</div>
+</div>
+
+<div class="entry">
+  <div class="blank"></div>
+</div>
+
+<!-- Assistant entry with thinking -->
+<div class="entry">
+  <div class="speaker">Assistant</div>
+  <div class="blank"></div>
+  <div class="thinking">
+    <span class="thinking-gutter">&nbsp;&nbsp;&#x2502; </span><span class="thinking">thinking</span><br>
+    <span class="thinking-gutter">&nbsp;&nbsp;&#x2502; </span>Alan wants to build a design vocabulary for Puzzle.<br>
+    <span class="thinking-gutter">&nbsp;&nbsp;&#x2502; </span>The question is about visual identity, not implementation.<br>
+    <span class="thinking-gutter">&nbsp;&nbsp;&#x2502; </span>Let me think about what contemporary TUI design means.<br>
+    <span class="thinking-gutter">&nbsp;&nbsp;&#x2502;</span>
+  </div>
+  <div class="blank"></div>
+  <div class="prose">The reason most TUIs look like developer prototypes is that they're built feature-first. Someone needs a list, they reach for <code>List</code>. They need a dialog, they reach for <code>Popup</code>. Each widget arrives with its own assumptions about borders, padding, color, and none of them know about each other. The result looks assembled, not designed.</div>
+  <div class="blank"></div>
+  <div class="prose"><strong>The conversation is a river.</strong> It flows down, it has rhythm. There are stretches of clear water &mdash; prose exchanges between you and Claude &mdash; and there are eddies where the current gets busy: tool calls, results, thinking blocks. The collapsed state is the river braiding around rocks.</div>
+  <div class="blank"></div>
+  <div class="prose">Color is semantic, not decorative. Three roles, maybe four. A base tone for ordinary text. An accent for the one thing that matters right now. A muted tone for secondary content &mdash; timestamps, tool names, collapsed summaries. And possibly a warning tone for the one moment Puzzle says &ldquo;stop and decide.&rdquo;</div>
+</div>
+
+<div class="entry">
+  <div class="blank"></div>
+</div>
+
+<!-- Human entry -->
+<div class="entry">
+  <div class="speaker">Human</div>
+  <div class="blank"></div>
+  <div class="prose">Yes, that resonates. What about the tools &mdash; how should they look in the flow?</div>
+</div>
+
+<div class="entry">
+  <div class="blank"></div>
+</div>
+
+<!-- Assistant entry with tool calls -->
+<div class="entry">
+  <div class="speaker">Assistant</div>
+  <div class="blank"></div>
+  <div class="prose">Let me look at the current rendering code.</div>
+  <div class="blank"></div>
+  <div class="tool-use">&nbsp;&nbsp;&#x25b6; Read</div>
+  <div class="tool-summary">~/code/flatheadmill/puzzle/src/render.rs</div>
+  <div class="tool-result-header">&nbsp;&nbsp;&#x25c0; result (560 lines)</div>
+  <div class="blank"></div>
+  <div class="tool-use">&nbsp;&nbsp;&#x25b6; Read</div>
+  <div class="tool-summary">~/code/flatheadmill/puzzle/src/main.rs</div>
+  <div class="tool-result-header">&nbsp;&nbsp;&#x25c0; result (857 lines)</div>
+  <div class="blank"></div>
+  <div class="prose">The rendering pipeline is sound. <code>render_entry</code> produces <code>Vec&lt;Line&gt;</code>, the caller wraps in <code>ListItem</code>. The markdown walker handles headings, emphasis, code blocks, lists with depth-based indentation. What needs to change is the surface, not the bones.</div>
+  <div class="blank"></div>
+  <div class="prose">Here's the palette I'm proposing:</div>
+  <div class="blank"></div>
+  <div class="code-block">&nbsp;&nbsp;pub const BASE: Color = Color::Rgb(200, 200, 195);</div>
+  <div class="code-block">&nbsp;&nbsp;pub const MUTED: Color = Color::Rgb(100, 100, 105);</div>
+  <div class="code-block">&nbsp;&nbsp;pub const FAINT: Color = Color::Rgb(65, 65, 70);</div>
+  <div class="code-block">&nbsp;&nbsp;pub const ACCENT: Color = Color::Rgb(100, 160, 200);</div>
+  <div class="code-block">&nbsp;&nbsp;pub const WARNING: Color = Color::Rgb(210, 160, 60);</div>
+</div>
+
+<div class="entry">
+  <div class="blank"></div>
+</div>
+
+<!-- Human entry -->
+<div class="entry">
+  <div class="speaker">Human</div>
+  <div class="blank"></div>
+  <div class="prose">Subduing the colors makes a world of difference.</div>
+</div>
+
+<div class="entry">
+  <div class="blank"></div>
+</div>
+
+<!-- Assistant entry with an edit -->
+<div class="entry">
+  <div class="speaker">Assistant</div>
+  <div class="blank"></div>
+  <div class="prose">It does. The conversation comes forward and everything else gets out of the way.</div>
+  <div class="blank"></div>
+  <div class="tool-use">&nbsp;&nbsp;&#x25b6; Edit</div>
+  <div class="tool-summary">~/code/flatheadmill/puzzle/src/render.rs</div>
+  <div class="tool-result-header">&nbsp;&nbsp;&#x25c0; result (12 lines)</div>
+  <div class="blank"></div>
+  <div class="tool-use">&nbsp;&nbsp;&#x25b6; Bash</div>
+  <div class="tool-summary">cargo check 2>&amp;1</div>
+  <div class="tool-result-header">&nbsp;&nbsp;&#x25c0; result (3 lines)</div>
+  <div class="blank"></div>
+  <div class="prose">Clean. Zero warnings.</div>
+</div>
+
+<div class="entry">
+  <div class="blank"></div>
+</div>
+
+</div><!-- conversation -->
+
+<!-- Input area -->
+<div style="position: relative; padding: 8px 0;">
+  <div class="input-area">
+    <div class="input-title">&nbsp;prompt (esc: scroll)&nbsp;</div>
+    <div><span class="input-cursor"></span></div>
+  </div>
+</div>
+
+</div><!-- terminal -->
+</body>
+</html>

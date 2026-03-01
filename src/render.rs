@@ -27,14 +27,27 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::model::{ContentBlock, ConversationEntry, EntryKind};
 
-// Markdown styles for assistant text. Simple first-pass palette — headings get
-// color and bold, emphasis and strong use standard terminal modifiers, code uses
-// a distinct color to stand out from surrounding prose.
-const MD_HEADING: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+// Palette. A small set of RGB values with semantic roles rather than per-widget
+// color choices. Ghostty on macOS with true color — no fallbacks needed.
+//
+// The hierarchy: prose is brightest, headers orient without shouting, tool
+// activity recedes, thinking is available but quiet. One accent for the thing
+// that matters right now, one warning for the moment that demands a decision.
+pub const BASE: Color = Color::Rgb(200, 200, 195);       // warm off-white for prose
+pub const MUTED: Color = Color::Rgb(100, 100, 105);      // headers, tool glyphs, timestamps
+pub const FAINT: Color = Color::Rgb(65, 65, 70);         // collapsed summaries, deep secondary
+pub const ACCENT: Color = Color::Rgb(100, 160, 200);     // active input, current focus
+pub const WARNING: Color = Color::Rgb(210, 160, 60);     // approval dialog, stop-and-decide
+pub const ERROR: Color = Color::Rgb(200, 100, 90);       // errors, warm not screaming
+pub const CODE: Color = Color::Rgb(150, 180, 140);       // inline code, subtle sage
+const CODE_BLOCK: Color = Color::Rgb(175, 175, 170);     // code blocks, near-base
+const GUTTER: Color = Color::Rgb(70, 100, 130);          // thinking gutter, dim steel
+
+const MD_HEADING: Style = Style::new().fg(BASE).add_modifier(Modifier::BOLD);
 const MD_EMPHASIS: Style = Style::new().add_modifier(Modifier::ITALIC);
 const MD_STRONG: Style = Style::new().add_modifier(Modifier::BOLD);
-const MD_CODE_INLINE: Style = Style::new().fg(Color::Green);
-const MD_CODE_BLOCK: Style = Style::new().fg(Color::White);
+const MD_CODE_INLINE: Style = Style::new().fg(CODE);
+const MD_CODE_BLOCK: Style = Style::new().fg(CODE_BLOCK);
 
 // A styled Line annotated with wrapping metadata. The markdown walker produces
 // these so the wrapping layer knows which lines to wrap and how to indent
@@ -64,9 +77,7 @@ pub fn render_entry(entry: &ConversationEntry, width: u16) -> Vec<Line<'static>>
             if !has_tool_results {
                 lines.push(Line::from(Span::styled(
                     "Human",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(MUTED),
                 )));
                 lines.push(Line::from(""));
             }
@@ -74,9 +85,7 @@ pub fn render_entry(entry: &ConversationEntry, width: u16) -> Vec<Line<'static>>
         EntryKind::Assistant => {
             lines.push(Line::from(Span::styled(
                 "Assistant",
-                Style::default()
-                    .fg(Color::Blue)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(MUTED),
             )));
             lines.push(Line::from(""));
         }
@@ -107,8 +116,8 @@ pub fn render_entry(entry: &ConversationEntry, width: u16) -> Vec<Line<'static>>
 }
 
 fn render_thinking(lines: &mut Vec<Line<'static>>, text: &str, width: u16) {
-    let style = Style::default().fg(Color::DarkGray);
-    let marker_style = Style::default().fg(Color::Cyan);
+    let style = Style::default().fg(FAINT);
+    let marker_style = Style::default().fg(GUTTER);
 
     lines.push(Line::from(vec![
         Span::styled("  \u{2502} ", marker_style),
@@ -139,7 +148,7 @@ fn render_thinking(lines: &mut Vec<Line<'static>>, text: &str, width: u16) {
 fn render_text(lines: &mut Vec<Line<'static>>, text: &str, kind: &EntryKind, width: u16) {
     match kind {
         EntryKind::User => {
-            let style = Style::default().fg(Color::White);
+            let style = Style::default().fg(BASE);
             for line in text.lines() {
                 lines.push(Line::from(Span::styled(line.to_string(), style)));
             }
@@ -407,7 +416,7 @@ impl MdWriter {
         }
         self.push_line(Line::from(Span::styled(
             "───",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(FAINT),
         )));
         self.needs_newline = true;
     }
@@ -479,10 +488,8 @@ fn style_wrap_with_indent(line: Line<'_>, max_width: u16, indent: usize) -> Vec<
 }
 
 fn render_tool_use(lines: &mut Vec<Line<'static>>, name: &str, summary: &str) {
-    let tool_style = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
-    let summary_style = Style::default().fg(Color::Yellow);
+    let tool_style = Style::default().fg(MUTED);
+    let summary_style = Style::default().fg(FAINT);
 
     lines.push(Line::from(vec![
         Span::styled(format!("  \u{25b6} {}", name), tool_style),
@@ -515,11 +522,11 @@ fn render_tool_use(lines: &mut Vec<Line<'static>>, name: &str, summary: &str) {
 // content has no ANSI codes, the crate produces unstyled text, same as before.
 // Error results keep the red style regardless of ANSI content.
 fn render_tool_result(lines: &mut Vec<Line<'static>>, content: &str, is_error: bool, collapsed: bool) {
-    let error_style = Style::default().fg(Color::Red);
+    let error_style = Style::default().fg(ERROR);
     let header_style = if is_error {
         error_style
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(FAINT)
     };
 
     let total = content.lines().count();
@@ -551,7 +558,7 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, content: &str, is_error: b
             for line in content.lines() {
                 lines.push(Line::from(Span::styled(
                     format!("    {}", line),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(FAINT),
                 )));
             }
         }

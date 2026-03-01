@@ -38,7 +38,7 @@ use color_eyre::eyre::{bail, Result};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use futures::StreamExt;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
@@ -54,7 +54,7 @@ use crate::app::{App, ApprovalDecision, Mode, PendingApproval, RunState};
 use crate::claude::{EasementEvent, EventReceiver, Invocation, Payload, SpawnTarget, StdoutEvent};
 use crate::model::{try_convert, ContentBlock, EntryKind};
 use crate::parser::parse_line;
-use crate::render::render_entry;
+use crate::render::{render_entry, ACCENT, BASE, CODE, ERROR, FAINT, MUTED, WARNING};
 use crate::tailer::run_tailer;
 use crate::transcript::Transcript;
 
@@ -171,6 +171,33 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(x, y, w, h)
 }
 
+/// Find the most recent previous window's transcript.jsonl for a slug.
+/// Scans the windows directory in reverse chronological order, skipping
+/// the current window, and returns the first non-empty transcript found.
+fn find_previous_transcript(
+    state_dir: &std::path::Path,
+    slug: &str,
+    current_window_ts: &str,
+) -> Option<PathBuf> {
+    let windows_dir = state_dir.join(slug).join("windows");
+    let mut dirs: Vec<_> = std::fs::read_dir(&windows_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| e.file_name().to_str() != Some(current_window_ts))
+        .collect();
+    dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    for dir in dirs {
+        let transcript = dir.path().join("transcript.jsonl");
+        if let Ok(meta) = std::fs::metadata(&transcript) {
+            if meta.len() > 0 {
+                return Some(transcript);
+            }
+        }
+    }
+    None
+}
+
 /// Format a timestamp for the window directory name. Uses the same style
 /// as the phase doc examples: 2026-02-22T04-30-00.123.
 fn window_timestamp() -> String {
@@ -271,6 +298,7 @@ async fn main() -> Result<()> {
     // not the remote session.
     let mut target = SpawnTarget::Local;
     let mut remote_session_id: Option<String> = None;
+    let mut loaded_entries = vec![];
 
     if repl_mode {
         let s = positional.clone();
@@ -301,7 +329,18 @@ async fn main() -> Result<()> {
         std::fs::create_dir_all(&window_dir)?;
 
         let transcript_path = window_dir.join("transcript.jsonl");
-        transcript = Some(Transcript::new(transcript_path));
+        let mut t = Transcript::new(transcript_path);
+
+        // Load the previous window's transcript so the conversation
+        // history is visible immediately, before the first prompt.
+        if let Some(prev) = find_previous_transcript(&puzzle_state_dir, &s, &window_ts) {
+            let loaded = t.load(&prev);
+            // Stash for pushing to the app after it's created.
+            // The entries are in self.entries for dedup; the UI
+            // entries go to the app below.
+            loaded_entries = loaded;
+        }
+        transcript = Some(t);
 
         // Look up the latest session. If none exists, bootstrap is
         // deferred to the first prompt because Easement requires a
@@ -370,6 +409,12 @@ async fn main() -> Result<()> {
 
     let mut terminal = ratatui::init();
     let mut app = App::new(repl_mode);
+
+    // Push any entries loaded from a previous window's transcript.
+    for entry in loaded_entries {
+        app.push_entry(entry);
+    }
+
     let mut events = EventStream::new();
     let mut frame_interval = tokio::time::interval(Duration::from_millis(33));
 
@@ -394,13 +439,14 @@ async fn main() -> Result<()> {
                         input_area = None;
                     }
 
-                    // conversation area with scrollbar
+                    // conversation area with left margin and scrollbar
                     let conv_chunks = Layout::horizontal([
+                        Constraint::Length(1),
                         Constraint::Min(0),
                         Constraint::Length(1),
                     ]).split(main_area);
 
-                    let conv_width = conv_chunks[0].width;
+                    let conv_width = conv_chunks[1].width;
                     let items: Vec<ListItem> = app
                         .entries
                         .iter()
@@ -413,12 +459,12 @@ async fn main() -> Result<()> {
                     let list = List::new(items)
                         .block(Block::default().borders(Borders::NONE));
 
-                    frame.render_stateful_widget(list, conv_chunks[0], &mut app.list_state);
+                    frame.render_stateful_widget(list, conv_chunks[1], &mut app.list_state);
 
                     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
                     let mut scrollbar_state = ScrollbarState::new(app.entries.len())
                         .position(app.list_state.selected().unwrap_or(0));
-                    frame.render_stateful_widget(scrollbar, conv_chunks[1], &mut scrollbar_state);
+                    frame.render_stateful_widget(scrollbar, conv_chunks[2], &mut scrollbar_state);
 
                     // prompt input area — tui-textarea renders itself as a
                     // widget and manages its own cursor. The block and style
@@ -434,21 +480,21 @@ async fn main() -> Result<()> {
                             (Mode::Scroll, RunState::Idle) => format!(" scroll (i: input){}", target_suffix),
                         };
 
-                        // Yellow border when targeting a remote machine so it is
+                        // Warning tone when targeting a remote machine so it is
                         // impossible to miss that you are running on someone else's
-                        // filesystem. Cyan for normal local input, gray otherwise.
+                        // filesystem. Accent for active local input, muted otherwise.
                         let border_style = if app.target_label.is_some() {
-                            Style::default().fg(Color::Yellow)
+                            Style::default().fg(WARNING)
                         } else if app.mode == Mode::Input && app.run_state == RunState::Idle {
-                            Style::default().fg(Color::Cyan)
+                            Style::default().fg(ACCENT)
                         } else {
-                            Style::default().fg(Color::DarkGray)
+                            Style::default().fg(FAINT)
                         };
 
                         let text_style = match (&app.mode, &app.run_state) {
-                            (_, RunState::Running) => Style::default().fg(Color::DarkGray),
-                            (Mode::Input, RunState::Idle) => Style::default().fg(Color::White),
-                            (Mode::Scroll, RunState::Idle) => Style::default().fg(Color::DarkGray),
+                            (_, RunState::Running) => Style::default().fg(MUTED),
+                            (Mode::Input, RunState::Idle) => Style::default().fg(BASE),
+                            (Mode::Scroll, RunState::Idle) => Style::default().fg(MUTED),
                         };
 
                         let input_block = Block::default()
@@ -471,10 +517,10 @@ async fn main() -> Result<()> {
                         let mut lines: Vec<Line> = vec![
                             Line::from(""),
                             Line::from(vec![
-                                Span::styled("  Tool: ", Style::default().fg(Color::DarkGray)),
+                                Span::styled("  Tool: ", Style::default().fg(MUTED)),
                                 Span::styled(
                                     approval.tool_name.clone(),
-                                    Style::default().fg(Color::Yellow),
+                                    Style::default().fg(WARNING),
                                 ),
                             ]),
                             Line::from(""),
@@ -484,23 +530,23 @@ async fn main() -> Result<()> {
                         for line in approval.input_summary.lines().take(8) {
                             lines.push(Line::from(Span::styled(
                                 format!("  {}", line),
-                                Style::default().fg(Color::White),
+                                Style::default().fg(BASE),
                             )));
                         }
                         let total_lines = approval.input_summary.lines().count();
                         if total_lines > 8 {
                             lines.push(Line::from(Span::styled(
                                 format!("  ... ({} more lines)", total_lines - 8),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(MUTED),
                             )));
                         }
 
                         lines.push(Line::from(""));
                         lines.push(Line::from(vec![
-                            Span::styled("  [y] ", Style::default().fg(Color::Green)),
-                            Span::styled("Allow  ", Style::default().fg(Color::White)),
-                            Span::styled("[n] ", Style::default().fg(Color::Red)),
-                            Span::styled("Deny", Style::default().fg(Color::White)),
+                            Span::styled("  [y] ", Style::default().fg(CODE)),
+                            Span::styled("Allow  ", Style::default().fg(BASE)),
+                            Span::styled("[n] ", Style::default().fg(ERROR)),
+                            Span::styled("Deny", Style::default().fg(BASE)),
                         ]));
 
                         let dialog = Paragraph::new(lines)
@@ -508,7 +554,7 @@ async fn main() -> Result<()> {
                                 Block::default()
                                     .borders(Borders::ALL)
                                     .title(" Approve? ")
-                                    .border_style(Style::default().fg(Color::Yellow)),
+                                    .border_style(Style::default().fg(WARNING)),
                             )
                             .wrap(Wrap { trim: false });
 
