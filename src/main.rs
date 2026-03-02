@@ -1,16 +1,17 @@
 // Puzzle: a TUI for Claude Code conversations. Two modes: viewer (tails an
-// existing JSONL transcript) and REPL (orchestrates Claude through Easement).
+// existing JSONL transcript) and REPL (orchestrates Claude through Wicket).
 //
-// In REPL mode, Puzzle spawns Easement per spurt. Easement wraps the Claude
-// CLI and multiplexes output into typed NDJSON envelopes. Puzzle reads one
-// stream and routes by the stream field: stdout events drive the drain gate,
-// transcript entries feed the official transcript for deduplication and
-// persistence, then new entries push to the UI.
+// In REPL mode, Puzzle spawns Wicket per spurt. Wicket is the coordinator —
+// it spawns Easement, handles SSH, binds the approval socket, and multiplexes
+// everything into a single NDJSON envelope stream. Puzzle reads envelopes and
+// routes by the stream field: stdout events drive the drain gate, transcript
+// entries feed the official transcript for deduplication and persistence,
+// approval requests trigger the dialog, then new entries push to the UI.
 //
-// The event loop is tokio::select! across five sources: a frame timer at 33ms,
-// the tailer channel (viewer mode only), the Easement event channel for stdout
-// and transcript envelopes, the Wicket Unix socket for approval requests, and
-// crossterm's EventStream for keyboard input.
+// The event loop is tokio::select! across four sources: a frame timer at 33ms,
+// the tailer channel (viewer mode only), the Wicket event channel for stdout,
+// transcript, and approval envelopes, and crossterm's EventStream for keyboard
+// input.
 //
 // State lives under ~/.local/state/puzzle/<slug>/ with sessions.jsonl for
 // session tracking and windows/<timestamp>/ directories for each window
@@ -18,8 +19,9 @@
 // record of the conversation. It feeds the UI and serves as the portable
 // artifact for machine migration.
 //
-// Logging goes to /tmp/puzzle.log via tracing with a non-blocking file writer.
-// RUST_LOG controls the filter; defaults to puzzle=debug.
+// Logging goes to ~/.local/state/puzzle/puzzle.log via tracing with a
+// non-blocking file writer. RUST_LOG controls the filter; defaults to
+// puzzle=debug.
 
 mod app;
 mod claude;
@@ -44,8 +46,6 @@ use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState, Wrap,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
@@ -145,18 +145,6 @@ fn init_tracing() -> WorkerGuard {
 async fn recv_easement(rx: &mut Option<EventReceiver>) -> Option<EasementEvent> {
     match rx {
         Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Accepts the next connection on the Wicket socket, or pends forever if
-/// no listener is bound. Used as a select! arm that disables itself in
-/// viewer mode or if the bind failed.
-async fn accept_wicket(
-    listener: &Option<UnixListener>,
-) -> std::io::Result<tokio::net::UnixStream> {
-    match listener {
-        Some(l) => l.accept().await.map(|(stream, _)| stream),
         None => std::future::pending().await,
     }
 }
@@ -375,37 +363,6 @@ async fn main() -> Result<()> {
             }
         });
     }
-
-    // Wicket socket listener. Binds in the pane directory so the path is
-    // naturally scoped by slug — no collisions between windows. Remove a
-    // stale socket file if one exists from a previous run. The listener
-    // persists across spurts — Puzzle binds once at startup and accepts
-    // connections as they arrive.
-    let wicket_socket_path = PathBuf::from(&home)
-        .join("pane")
-        .join(slug.as_ref().unwrap_or(&positional))
-        .join("wicket.sock");
-    let wicket_listener = if repl_mode {
-        let _ = std::fs::remove_file(&wicket_socket_path);
-        match UnixListener::bind(&wicket_socket_path) {
-            Ok(l) => {
-                tracing::info!("wicket socket listener bound at {}", wicket_socket_path.display());
-                Some(l)
-            }
-            Err(e) => {
-                tracing::error!("failed to bind wicket socket: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // The Wicket connection is split: the read half is consumed in the
-    // accept arm to parse the request, and the write half is stashed here
-    // until the operator presses y/n. The connection stays open across loop
-    // iterations — Wicket is blocking on the other end waiting for our
-    // response, which keeps Claude blocked too.
-    let mut wicket_writer: Option<tokio::net::unix::OwnedWriteHalf> = None;
 
     let mut terminal = ratatui::init();
     let mut app = App::new(repl_mode);
@@ -644,6 +601,20 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
+                    Some(EasementEvent::Approval(data)) => {
+                        let tool_name = data.get("tool_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let input = data.get("input")
+                            .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
+                            .unwrap_or_default();
+                        tracing::info!(tool = %tool_name, "approval request received");
+                        app.pending_approval = Some(PendingApproval {
+                            tool_name,
+                            input_summary: input,
+                        });
+                    }
                     None => {
                         // Channel closed — reader task finished. Normal
                         // after drain. If the invocation is still alive
@@ -661,44 +632,6 @@ async fn main() -> Result<()> {
                             tracing::info!("channel closed, invocation complete");
                         }
                         claude_rx = None;
-                    }
-                }
-            }
-            // The select guard is the concurrency model. While an approval
-            // is pending, we stop accepting new connections entirely. This is
-            // why pending_approval and wicket_writer can both be simple Options
-            // rather than queues — there is never more than one in flight.
-            // Wicket holds the MCP connection open on its side, so Claude blocks
-            // until we respond. No races, no ordering concerns, no dropped requests.
-            Ok(stream) = accept_wicket(&wicket_listener), if app.pending_approval.is_none() => {
-                let (reader, writer) = stream.into_split();
-                let mut buf_reader = BufReader::new(reader);
-                let mut line = String::new();
-                match buf_reader.read_line(&mut line).await {
-                    Ok(0) => {
-                        tracing::warn!("wicket connection closed before sending request");
-                    }
-                    Ok(_) => {
-                        if let Ok(request) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-                            let tool_name = request.get("tool_name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            let input = request.get("input")
-                                .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
-                                .unwrap_or_default();
-                            tracing::info!(tool = %tool_name, "approval request received");
-                            app.pending_approval = Some(PendingApproval {
-                                tool_name,
-                                input_summary: input,
-                            });
-                            wicket_writer = Some(writer);
-                        } else {
-                            tracing::warn!("failed to parse wicket request: {}", line.trim());
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("failed to read wicket request: {}", e);
                     }
                 }
             }
@@ -790,17 +723,16 @@ async fn main() -> Result<()> {
                                         } else {
                                             None
                                         },
-                                        wicket_socket: None,
                                     };
 
                                     match Invocation::spawn(&target, payload).await {
                                         Ok((inv, erx)) => {
-                                            tracing::info!("easement spawned");
+                                            tracing::info!("wicket spawned");
                                             invocation = Some(inv);
                                             claude_rx = Some(erx);
                                         }
                                         Err(e) => {
-                                            tracing::error!("failed to spawn easement: {}", e);
+                                            tracing::error!("failed to spawn wicket: {}", e);
                                             continue;
                                         }
                                     }
@@ -819,38 +751,26 @@ async fn main() -> Result<()> {
 
         // Handle approval decisions outside the select! so the write
         // happens promptly after the key press, not on the next tick.
-        //
-        // The response goes to Wicket over the Unix socket, not to Claude
-        // directly. Wicket constructs the full MCP tool response including
-        // updatedInput (which the CLI's Zod schema requires on allow) before
-        // relaying to Claude. Puzzle only needs behavior and an optional
-        // denial message.
+        // The decision goes back to Wicket as an approval envelope on
+        // stdin. Wicket writes it to the held socket connection.
         if let Some(decision) = app.approval_decision.take() {
-            if let Some(mut writer) = wicket_writer.take() {
-                let response = match decision {
+            if let Some(ref mut inv) = invocation {
+                match decision {
                     ApprovalDecision::Allow => {
                         tracing::info!("approval: allow");
-                        "{\"behavior\":\"allow\"}\n"
+                        let _ = inv.approve(true, None).await;
                     }
                     ApprovalDecision::Deny => {
                         tracing::info!("approval: deny");
-                        "{\"behavior\":\"deny\",\"message\":\"User denied permission\"}\n"
+                        let _ = inv.approve(false, Some("User denied permission")).await;
                     }
-                };
-                let _ = writer.write_all(response.as_bytes()).await;
-                let _ = writer.flush().await;
-                let _ = writer.shutdown().await;
+                }
             }
         }
 
         if app.should_quit {
             break;
         }
-    }
-
-    // Clean up the wicket socket on exit.
-    if repl_mode {
-        let _ = std::fs::remove_file(wicket_socket_path);
     }
 
     ratatui::restore();
