@@ -1,17 +1,48 @@
-// Model layer. Sits between parser.rs (raw JSONL schema) and render.rs
-// (styled output). The parser deserializes the full JSONL format faithfully;
-// this module filters to the main conversation chain and converts to
-// display-ready types.
-//
-// The sidechain filter (is_sidechain) drops Claude's internal branching —
-// entries where the model explored alternatives that were not presented.
-// ContentBlock is deliberately simpler than the parser types: it flattens
-// the structural variations into what the renderer needs.
+// Model layer. Receives normalized entries from Wicket's wire format and
+// converts to display-ready types for the renderer. The filtering, parsing,
+// and normalization all happen in Wicket now — Puzzle just deserializes
+// and adds UI state (collapsed flag on tool results).
 
-use crate::parser::{
-    AssistantContentBlock, AssistantEntry, Entry, TextBlock, ThinkingBlock, ToolResultBlock,
-    ToolResultContent, ToolUseBlock, UserContent, UserContentBlock, UserEntry,
-};
+use serde::Deserialize;
+use serde_json::Value;
+
+// -- Wire types from Wicket --
+
+#[derive(Debug, Deserialize)]
+struct WireEntry {
+    kind: String,
+    blocks: Vec<WireBlock>,
+    #[allow(dead_code)]
+    uuid: Option<String>,
+    #[allow(dead_code)]
+    seq: Option<u64>,
+    #[allow(dead_code)]
+    timestamp: Option<String>,
+    #[allow(dead_code)]
+    input_tokens: Option<u64>,
+    #[allow(dead_code)]
+    output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+enum WireBlock {
+    Thinking { text: String },
+    Text { text: String },
+    ToolUse {
+        name: String,
+        input_summary: String,
+        #[allow(dead_code)]
+        input: Option<Value>,
+    },
+    ToolResult {
+        content: String,
+        is_error: bool,
+    },
+}
+
+// -- Display types for the renderer --
 
 #[derive(Debug)]
 pub enum ContentBlock {
@@ -27,180 +58,62 @@ pub enum EntryKind {
     Assistant,
 }
 
-#[derive(Debug)]
-#[allow(dead_code)] // timestamp, uuid, token counts parsed but not yet displayed
+#[allow(dead_code)]
 pub struct ConversationEntry {
     pub kind: EntryKind,
     pub blocks: Vec<ContentBlock>,
-    pub timestamp: Option<String>,
     pub uuid: Option<String>,
+    pub seq: Option<u64>,
+    pub timestamp: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
 }
 
-/// Filter and convert a raw parsed Entry into a display-ready
-/// ConversationEntry. Returns None for entries that should be
-/// skipped (progress, system, sidechains, empty content).
-pub fn try_convert(entry: Entry) -> Option<ConversationEntry> {
-    match entry {
-        Entry::User(user) if !user.is_sidechain => convert_user(user),
-        Entry::Assistant(assistant) if !assistant.is_sidechain => convert_assistant(assistant),
-        _ => None,
-    }
-}
+impl ConversationEntry {
+    /// Deserialize from Wicket's wire format (serde_json::Value).
+    pub fn from_value(value: serde_json::Value) -> Option<Self> {
+        let wire: WireEntry = serde_json::from_value(value).ok()?;
 
-fn convert_user(entry: UserEntry) -> Option<ConversationEntry> {
-    let blocks = match entry.message.content {
-        UserContent::Text(text) => {
-            vec![ContentBlock::Text { text }]
-        }
-        UserContent::Blocks(content_blocks) => {
-            let mut blocks = Vec::new();
-            for block in content_blocks {
-                match block {
-                    UserContentBlock::ToolResult(ToolResultBlock {
-                        content,
-                        is_error,
-                        ..
-                    }) => {
-                        let text = match content {
-                            Some(ToolResultContent::Text(s)) => s,
-                            Some(ToolResultContent::Blocks(_)) => "(structured content)".into(),
-                            None => String::new(),
-                        };
-                        blocks.push(ContentBlock::ToolResult {
-                            content: text,
-                            is_error,
-                            collapsed: true,
-                        });
-                    }
-                    UserContentBlock::Text(TextBlock { text }) => {
-                        blocks.push(ContentBlock::Text { text });
-                    }
-                    UserContentBlock::Unknown => {}
-                }
-            }
-            blocks
-        }
-    };
+        let kind = match wire.kind.as_str() {
+            "user" => EntryKind::User,
+            "assistant" => EntryKind::Assistant,
+            _ => return None,
+        };
 
-    if blocks.is_empty() {
-        return None;
-    }
-
-    Some(ConversationEntry {
-        kind: EntryKind::User,
-        blocks,
-        timestamp: entry.timestamp,
-        uuid: entry.uuid,
-        input_tokens: None,
-        output_tokens: None,
-    })
-}
-
-fn convert_assistant(entry: AssistantEntry) -> Option<ConversationEntry> {
-    let mut blocks = Vec::new();
-
-    for block in entry.message.content {
-        match block {
-            AssistantContentBlock::Thinking(ThinkingBlock { thinking, .. }) => {
-                blocks.push(ContentBlock::Thinking { text: thinking });
-            }
-            AssistantContentBlock::Text(TextBlock { text }) => {
-                blocks.push(ContentBlock::Text { text });
-            }
-            AssistantContentBlock::ToolUse(ToolUseBlock { name, input, .. }) => {
-                let summary = summarize_tool_input(&name, &input);
-                blocks.push(ContentBlock::ToolUse {
+        let blocks: Vec<ContentBlock> = wire
+            .blocks
+            .into_iter()
+            .map(|b| match b {
+                WireBlock::Thinking { text } => ContentBlock::Thinking { text },
+                WireBlock::Text { text } => ContentBlock::Text { text },
+                WireBlock::ToolUse {
                     name,
-                    input_summary: summary,
-                });
-            }
-            AssistantContentBlock::Unknown => {}
+                    input_summary,
+                    ..
+                } => ContentBlock::ToolUse {
+                    name,
+                    input_summary,
+                },
+                WireBlock::ToolResult { content, is_error } => ContentBlock::ToolResult {
+                    content,
+                    is_error,
+                    collapsed: true,
+                },
+            })
+            .collect();
+
+        if blocks.is_empty() {
+            return None;
         }
-    }
 
-    if blocks.is_empty() {
-        return None;
-    }
-
-    let (input_tokens, output_tokens) = entry
-        .message
-        .usage
-        .map(|u| (u.input_tokens, u.output_tokens))
-        .unwrap_or((None, None));
-
-    Some(ConversationEntry {
-        kind: EntryKind::Assistant,
-        blocks,
-        timestamp: entry.timestamp,
-        uuid: entry.uuid,
-        input_tokens,
-        output_tokens,
-    })
-}
-
-// Extracts the most useful field from each tool type's input for the compact
-// tool_use display. Bash shows the command, Read/Write/Edit show the file path,
-// Glob/Grep show the pattern. Unknown tools fall back to listing their input
-// field names. The goal is a one-line summary that tells you what the tool call
-// is doing without expanding the full input.
-fn summarize_tool_input(tool_name: &str, input: &serde_json::Value) -> String {
-    match tool_name {
-        "Bash" => input
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        "Read" => input
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        "Write" => input
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        "Edit" => input
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        "Glob" => input
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        "Grep" => input
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        "Task" => input
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .map(|s| truncate(s, 80))
-            .unwrap_or_default(),
-        _ => {
-            let keys: Vec<&str> = input
-                .as_object()
-                .map(|m| m.keys().map(|k| k.as_str()).collect())
-                .unwrap_or_default();
-            keys.join(", ")
-        }
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        let boundary = s.char_indices()
-            .map(|(i, _)| i)
-            .take_while(|&i| i <= max)
-            .last()
-            .unwrap_or(0);
-        format!("{}...", &s[..boundary])
+        Some(ConversationEntry {
+            kind,
+            blocks,
+            uuid: wire.uuid,
+            seq: wire.seq,
+            timestamp: wire.timestamp,
+            input_tokens: wire.input_tokens,
+            output_tokens: wire.output_tokens,
+        })
     }
 }

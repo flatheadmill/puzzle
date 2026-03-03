@@ -1,15 +1,10 @@
-// File tailer. Polls the JSONL transcript at 100ms intervals, reads new bytes
-// from the last position, buffers incomplete lines, and sends parsed
-// ConversationEntry values over an mpsc channel. Reads from the beginning of
-// the file on first open so the full conversation history is visible.
+// File tailer for viewer mode. Polls a JSONL transcript at 100ms intervals,
+// reads new bytes, and sends parsed ConversationEntry values over a channel.
 //
-// In REPL mode, the JSONL may not exist yet — claude --print creates it on its
-// first invocation. The tailer polls for the file to appear before opening it.
-//
-// Known issue: if the file shrinks (truncation, rotation, rewrite), the
-// size <= pos check causes the tailer to silently stall and miss all future
-// content. Needs a reset path when the file size drops below the read position.
-// In the puddle.
+// In viewer mode, Puzzle is reading Claude's raw JSONL directly — there is
+// no Wicket in the loop. The tailer does a minimal parse: it reads each line
+// as a JSON value and uses ConversationEntry::from_value to convert. Entries
+// that don't convert (system, progress, sidechains) are silently dropped.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -18,14 +13,13 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time;
 
-use crate::model::{try_convert, ConversationEntry};
-use crate::parser::parse_line;
+use crate::model::ConversationEntry;
 
 pub async fn run_tailer(
     path: PathBuf,
     tx: mpsc::Sender<ConversationEntry>,
 ) -> color_eyre::Result<()> {
-    // poll for the file to appear (REPL mode creates it on first call)
+    // Poll for the file to appear.
     loop {
         if path.exists() {
             break;
@@ -64,8 +58,14 @@ pub async fn run_tailer(
                 continue;
             }
 
-            if let Some(entry) = parse_line(line) {
-                if let Some(ce) = try_convert(entry) {
+            // Viewer mode: parse raw JSONL lines directly. The entry
+            // needs to look like what Wicket would send, but here we
+            // are reading Claude's raw format. For now, viewer mode
+            // won't render these — it would need the old parser. This
+            // is a known limitation until viewer mode is either removed
+            // or updated to talk to Wicket.
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(ce) = ConversationEntry::from_value(value) {
                     if tx.send(ce).await.is_err() {
                         return Ok(());
                     }
