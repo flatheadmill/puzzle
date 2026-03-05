@@ -483,7 +483,7 @@ async fn main() -> Result<()> {
 
     ratatui::restore();
 
-    // Shut down Wicket.
+    // Disconnect from Wicket.
     if let Some(conn) = wicket {
         let _ = conn.shutdown().await;
     }
