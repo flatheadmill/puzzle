@@ -11,8 +11,6 @@
 // Wicket sends back envelopes with stream values of entry, lifecycle,
 // approval, meta, and error.
 
-use std::time::Duration;
-
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
@@ -56,26 +54,7 @@ pub struct WicketConnection {
 }
 
 impl WicketConnection {
-    /// Connect to Wicket over WebSocket. If Wicket is not running, start it
-    /// as a background process and retry.
     pub async fn connect(slug: &str) -> Result<(Self, EventReceiver), std::io::Error> {
-        match Self::try_connect(slug).await {
-            Ok(result) => Ok(result),
-            Err(_) => {
-                tracing::info!("wicket not running, starting it");
-                let _ = std::process::Command::new("wicket")
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()?;
-
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                Self::try_connect(slug).await
-            }
-        }
-    }
-
-    async fn try_connect(slug: &str) -> Result<(Self, EventReceiver), std::io::Error> {
         let url = "ws://127.0.0.1:6502";
         let (ws_stream, _) = tokio_tungstenite::connect_async(url)
             .await
