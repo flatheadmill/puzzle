@@ -330,24 +330,40 @@ async fn main() -> Result<()> {
             event = recv_wicket(&mut wicket_rx) => {
                 match event {
                     Some(WicketEvent::Entry(entry)) => {
+                        if let Some(ref conn) = wicket {
+                            conn.log("info", "entry received", serde_json::json!({
+                                "kind": format!("{:?}", entry.kind),
+                                "blocks": entry.blocks.len(),
+                                "seq": entry.seq,
+                                "total": app.entries.len() + 1,
+                            }));
+                        }
                         app.push_entry(entry);
                     }
                     Some(WicketEvent::Lifecycle(event_name)) => {
                         match event_name.as_str() {
                             "round_started" => {
                                 tracing::info!("round started");
-                                // Run state was already set when we submitted.
                             }
                             "round_completed" => {
                                 tracing::info!("round completed");
+                                if let Some(ref conn) = wicket {
+                                    conn.log("info", "round completed", serde_json::json!({
+                                        "entries": app.entries.len(),
+                                    }));
+                                }
                                 app.run_state = RunState::Idle;
                                 app.mode = Mode::Input;
                                 app.follow = true;
                             }
                             other => {
-                                // round_failed or unknown
                                 if other.starts_with("round_failed") || other.contains("round_failed") {
                                     tracing::warn!("round failed: {}", other);
+                                    if let Some(ref conn) = wicket {
+                                        conn.log("error", "round failed", serde_json::json!({
+                                            "detail": other,
+                                        }));
+                                    }
                                     app.run_state = RunState::Idle;
                                     app.mode = Mode::Input;
                                     app.follow = true;
@@ -368,6 +384,11 @@ async fn main() -> Result<()> {
                             .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
                             .unwrap_or_default();
                         tracing::info!(tool = %tool_name, "approval request");
+                        if let Some(ref conn) = wicket {
+                            conn.log("info", "approval request", serde_json::json!({
+                                "tool": &tool_name,
+                            }));
+                        }
                         app.pending_approval = Some(PendingApproval {
                             tool_name,
                             input_summary: input,
@@ -378,10 +399,17 @@ async fn main() -> Result<()> {
                     }
                     Some(WicketEvent::Error(msg)) => {
                         tracing::error!("wicket error: {}", msg);
+                        if let Some(ref conn) = wicket {
+                            conn.log("error", "wicket error", serde_json::json!({
+                                "message": &msg,
+                            }));
+                        }
                     }
                     None => {
-                        // Wicket closed — connection lost.
                         tracing::warn!("wicket connection closed");
+                        if let Some(ref conn) = wicket {
+                            conn.log("warn", "connection closed", serde_json::json!({}));
+                        }
                         wicket_rx = None;
                         app.run_state = RunState::Idle;
                         app.mode = Mode::Input;
@@ -441,6 +469,10 @@ async fn main() -> Result<()> {
                                         target = ?target,
                                         "prompt submitted"
                                     );
+                                    conn.log("info", "prompt submitted", serde_json::json!({
+                                        "prompt_len": prompt.len(),
+                                        "target": format!("{:?}", target),
+                                    }));
                                     match conn.send(&prompt, &target).await {
                                         Ok(()) => {
                                             app.run_state = RunState::Running;
@@ -448,6 +480,9 @@ async fn main() -> Result<()> {
                                         }
                                         Err(e) => {
                                             tracing::error!("failed to send to wicket: {}", e);
+                                            conn.log("error", "send failed", serde_json::json!({
+                                                "error": e.to_string(),
+                                            }));
                                         }
                                     }
                                 }
@@ -466,10 +501,12 @@ async fn main() -> Result<()> {
                 match decision {
                     ApprovalDecision::Allow => {
                         tracing::info!("approval: allow");
+                        conn.log("info", "approval: allow", serde_json::json!({}));
                         let _ = conn.approve(true, None).await;
                     }
                     ApprovalDecision::Deny => {
                         tracing::info!("approval: deny");
+                        conn.log("info", "approval: deny", serde_json::json!({}));
                         let _ = conn.approve(false, Some("User denied permission")).await;
                     }
                 }

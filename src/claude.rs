@@ -216,6 +216,17 @@ impl WicketConnection {
         Ok(())
     }
 
+    /// Send a log entry to Wicket for centralized logging.
+    pub fn log(&self, level: &str, message: &str, fields: serde_json::Value) {
+        let data = serde_json::json!({
+            "level": level,
+            "message": message,
+            "fields": fields,
+        });
+        let envelope = serde_json::json!({ "stream": "log", "data": data });
+        let _ = self.outbound_tx.send(envelope.to_string());
+    }
+
     /// Graceful disconnect. Sends an explicit exit message rather than
     /// relying on socket close semantics.
     pub async fn shutdown(self) -> Result<(), std::io::Error> {
