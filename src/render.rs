@@ -30,11 +30,12 @@ use crate::model::{ContentBlock, ConversationEntry, EntryKind};
 // Palette. A small set of RGB values with semantic roles rather than per-widget
 // color choices. Ghostty on macOS with true color — no fallbacks needed.
 //
-// The hierarchy: prose is brightest, headers orient without shouting, tool
-// activity recedes, thinking is available but quiet. One accent for the thing
-// that matters right now, one warning for the moment that demands a decision.
+// The hierarchy: prose is brightest, thinking is close behind (provisional,
+// not backgrounded), tool activity recedes. One accent for the thing that
+// matters right now, one warning for the moment that demands a decision.
 pub const BASE: Color = Color::Rgb(200, 200, 195);       // warm off-white for prose
-pub const MUTED: Color = Color::Rgb(100, 100, 105);      // headers, tool glyphs, timestamps
+pub const THINKING: Color = Color::Rgb(155, 155, 150);   // thinking text, provisional not dim
+pub const MUTED: Color = Color::Rgb(100, 100, 105);      // tool glyphs, timestamps
 pub const FAINT: Color = Color::Rgb(65, 65, 70);         // collapsed summaries, deep secondary
 pub const ACCENT: Color = Color::Rgb(100, 160, 200);     // active input, current focus
 pub const WARNING: Color = Color::Rgb(210, 160, 60);     // approval dialog, stop-and-decide
@@ -42,6 +43,18 @@ pub const ERROR: Color = Color::Rgb(200, 100, 90);       // errors, warm not scr
 pub const CODE: Color = Color::Rgb(150, 180, 140);       // inline code, subtle sage
 const CODE_BLOCK: Color = Color::Rgb(175, 175, 170);     // code blocks, near-base
 const GUTTER: Color = Color::Rgb(70, 100, 130);          // thinking gutter, dim steel
+
+// Glyph markers for the left rail.
+const GLYPH_USER: &str = "\u{203a} ";                    // › for user (types at the caret)
+const GLYPH_ASSISTANT: &str = "\u{00b7} ";               // · for assistant
+const GLYPH_THINKING: &str = "\u{2502} ";                // │ for thinking blocks
+const GLYPH_USER_COLOR: Color = Color::Rgb(130, 130, 135);
+const GLYPH_ASSISTANT_COLOR: Color = Color::Rgb(120, 120, 125);
+
+// Background bands for entry types.
+pub const BG_USER: Color = Color::Rgb(30, 30, 32);
+pub const BG_ASSISTANT: Color = Color::Rgb(26, 28, 32);
+pub const BG_THINKING: Color = Color::Rgb(24, 26, 30);
 
 const MD_HEADING: Style = Style::new().fg(BASE).add_modifier(Modifier::BOLD);
 const MD_EMPHASIS: Style = Style::new().add_modifier(Modifier::ITALIC);
@@ -60,105 +73,130 @@ struct MarkedLine {
     indent_level: usize,
 }
 
-pub fn render_entry(entry: &ConversationEntry, width: u16) -> Vec<Line<'static>> {
+/// Returns (lines, background_color) so the caller can set the background
+/// on the ListItem for full-width coverage.
+pub fn render_entry(entry: &ConversationEntry, width: u16) -> (Vec<Line<'static>>, Color) {
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let content_width = width.saturating_sub(4); // 2ch gutter + 2ch right margin
+    let mut first_prose = true;
 
-    match entry.kind {
-        EntryKind::User => {
-            let has_tool_results = entry
-                .blocks
-                .iter()
-                .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+    let bg = match entry.kind {
+        EntryKind::User => BG_USER,
+        EntryKind::Assistant => BG_ASSISTANT,
+    };
 
-            // User entries that consist only of tool results suppress the
-            // "Human" header. These entries follow a tool_use visually, and
-            // adding a header between the tool call and its result breaks
-            // the reading flow.
-            if !has_tool_results {
-                lines.push(Line::from(Span::styled(
-                    "Human",
-                    Style::default().fg(MUTED),
-                )));
-                lines.push(Line::from(""));
-            }
-        }
-        EntryKind::Assistant => {
-            lines.push(Line::from(Span::styled(
-                "Assistant",
-                Style::default().fg(MUTED),
-            )));
-            lines.push(Line::from(""));
-        }
-    }
+    // Top padding inside the background band.
+    lines.push(Line::from(""));
 
     for block in &entry.blocks {
         match block {
             ContentBlock::Thinking { text } => {
-                render_thinking(&mut lines, text, width);
+                render_thinking(&mut lines, text, content_width);
             }
             ContentBlock::Text { text } => {
-                render_text(&mut lines, text, &entry.kind, width);
+                let glyph = if first_prose {
+                    first_prose = false;
+                    true
+                } else {
+                    false
+                };
+                render_text(&mut lines, text, &entry.kind, content_width, glyph);
             }
             ContentBlock::ToolUse {
                 name,
                 input_summary,
             } => {
-                render_tool_use(&mut lines, name, input_summary);
+                render_tool_use(&mut lines, name, input_summary, &entry.kind);
             }
             ContentBlock::ToolResult { content, is_error, collapsed } => {
-                render_tool_result(&mut lines, content, *is_error, *collapsed);
+                render_tool_result(&mut lines, content, *is_error, *collapsed, &entry.kind);
             }
         }
     }
 
+    // Bottom padding inside the background band.
     lines.push(Line::from(""));
-    lines
+
+    (lines, bg)
 }
 
 fn render_thinking(lines: &mut Vec<Line<'static>>, text: &str, width: u16) {
-    let style = Style::default().fg(FAINT);
+    let text_style = Style::default().fg(THINKING);
     let marker_style = Style::default().fg(GUTTER);
+    let bg = Style::default().bg(BG_THINKING);
 
     lines.push(Line::from(vec![
-        Span::styled("  \u{2502} ", marker_style),
-        Span::styled("thinking", style.add_modifier(Modifier::ITALIC)),
-    ]));
+        Span::styled(GLYPH_THINKING, marker_style),
+        Span::styled("thinking", Style::default().fg(GUTTER).add_modifier(Modifier::ITALIC)),
+    ]).style(bg));
 
-    // prefix "  │ " is 4 columns, wrap thinking text to fit
-    let available = (width as usize).saturating_sub(4).max(1);
+    // The glyph is 2 columns; wrap thinking text to fit remaining width.
+    let available = (width as usize).saturating_sub(2).max(1);
 
     for line in text.lines() {
         if line.is_empty() {
             lines.push(Line::from(vec![
-                Span::styled("  \u{2502} ", marker_style),
-            ]));
+                Span::styled(GLYPH_THINKING, marker_style),
+            ]).style(bg));
             continue;
         }
         for wrapped in textwrap::wrap(line, available) {
             lines.push(Line::from(vec![
-                Span::styled("  \u{2502} ", marker_style),
-                Span::styled(wrapped.into_owned(), style),
-            ]));
+                Span::styled(GLYPH_THINKING, marker_style),
+                Span::styled(wrapped.into_owned(), text_style),
+            ]).style(bg));
         }
     }
 
-    lines.push(Line::from(Span::styled("  \u{2502}", marker_style)));
+    lines.push(Line::from(Span::styled(GLYPH_THINKING.trim_end(), marker_style)).style(bg));
 }
 
-fn render_text(lines: &mut Vec<Line<'static>>, text: &str, kind: &EntryKind, width: u16) {
+fn render_text(lines: &mut Vec<Line<'static>>, text: &str, kind: &EntryKind, width: u16, show_glyph: bool) {
     match kind {
         EntryKind::User => {
             let style = Style::default().fg(BASE);
-            for line in text.lines() {
-                lines.push(Line::from(Span::styled(line.to_string(), style)));
+            for (i, line) in text.lines().enumerate() {
+                let glyph = if i == 0 && show_glyph {
+                    Span::styled(GLYPH_USER, Style::default().fg(GLYPH_USER_COLOR))
+                } else {
+                    Span::raw("  ")
+                };
+                lines.push(Line::from(vec![
+                    glyph,
+                    Span::styled(line.to_string(), style),
+                ]));
             }
         }
         EntryKind::Assistant => {
+            let mut first = show_glyph;
             for ml in render_markdown(text) {
-                if ml.no_wrap {
-                    lines.push(ml.line);
+                let glyph = if first {
+                    first = false;
+                    Span::styled(GLYPH_ASSISTANT, Style::default().fg(GLYPH_ASSISTANT_COLOR))
                 } else {
-                    lines.extend(style_wrap_with_indent(ml.line, width, ml.indent_level));
+                    Span::raw("  ")
+                };
+
+                if ml.no_wrap {
+                    let mut spans = vec![glyph];
+                    spans.extend(ml.line.spans);
+                    lines.push(Line::from(spans));
+                } else {
+                    // Prepend glyph/indent to the first wrapped line,
+                    // spaces to continuations.
+                    let wrapped = style_wrap_with_indent(ml.line, width, ml.indent_level);
+                    for (j, wl) in wrapped.into_iter().enumerate() {
+                        let prefix = if j == 0 {
+                            glyph.clone()
+                        } else {
+                            Span::raw("  ")
+                        };
+                        let mut spans = vec![prefix];
+                        spans.extend(wl.spans);
+                        lines.push(Line::from(spans));
+                        // Only the very first line of the entry gets the glyph.
+                        // After that, glyph is already Span::raw("  ").
+                    }
                 }
             }
         }
@@ -487,28 +525,23 @@ fn style_wrap_with_indent(line: Line<'_>, max_width: u16, indent: usize) -> Vec<
     output_lines
 }
 
-fn render_tool_use(lines: &mut Vec<Line<'static>>, name: &str, summary: &str) {
+fn render_tool_use(lines: &mut Vec<Line<'static>>, name: &str, summary: &str, _kind: &EntryKind) {
     let tool_style = Style::default().fg(MUTED);
     let summary_style = Style::default().fg(FAINT);
 
-    lines.push(Line::from(vec![
-        Span::styled(format!("  \u{25b6} {}", name), tool_style),
-    ]));
-
-    if !summary.is_empty() {
-        for line in summary.lines().take(5) {
-            lines.push(Line::from(Span::styled(
-                format!("    {}", line),
-                summary_style,
-            )));
-        }
-        let line_count = summary.lines().count();
-        if line_count > 5 {
-            lines.push(Line::from(Span::styled(
-                format!("    ... ({} more lines)", line_count - 5),
-                summary_style,
-            )));
-        }
+    // Tool name with first line of summary on the same line.
+    let first_summary = summary.lines().next().unwrap_or("");
+    if first_summary.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("\u{25b6} {}", name), tool_style),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("\u{25b6} {} \u{00b7} ", name), tool_style),
+            Span::styled(first_summary.to_string(), summary_style),
+        ]));
     }
 }
 
@@ -521,7 +554,7 @@ fn render_tool_use(lines: &mut Vec<Line<'static>>, name: &str, summary: &str) {
 // command output) are parsed via ansi-to-tui into styled ratatui lines. If the
 // content has no ANSI codes, the crate produces unstyled text, same as before.
 // Error results keep the red style regardless of ANSI content.
-fn render_tool_result(lines: &mut Vec<Line<'static>>, content: &str, is_error: bool, collapsed: bool) {
+fn render_tool_result(lines: &mut Vec<Line<'static>>, content: &str, is_error: bool, collapsed: bool, _kind: &EntryKind) {
     let error_style = Style::default().fg(ERROR);
     let header_style = if is_error {
         error_style
@@ -532,23 +565,26 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, content: &str, is_error: b
     let total = content.lines().count();
 
     let label = if is_error { "error" } else { "result" };
-    lines.push(Line::from(Span::styled(
-        format!("  \u{25c0} {} ({} lines)", label, total),
-        header_style,
-    )));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!("\u{25c0} {} ({} lines)", label, total),
+            header_style,
+        ),
+    ]));
 
     if !collapsed {
         if is_error {
             for line in content.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("    {}", line),
-                    error_style,
-                )));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(line.to_string(), error_style),
+                ]));
             }
         } else if let Ok(text) = content.as_bytes().into_text() {
             for line in text.lines {
                 let mut prefixed: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
-                prefixed.push(Span::raw("    "));
+                prefixed.push(Span::raw("  "));
                 prefixed.extend(line.spans.into_iter().map(|s| {
                     Span::styled(s.content.into_owned(), s.style)
                 }));
@@ -556,10 +592,10 @@ fn render_tool_result(lines: &mut Vec<Line<'static>>, content: &str, is_error: b
             }
         } else {
             for line in content.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("    {}", line),
-                    Style::default().fg(FAINT),
-                )));
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(line.to_string(), Style::default().fg(FAINT)),
+                ]));
             }
         }
     }

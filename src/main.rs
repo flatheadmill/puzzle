@@ -33,8 +33,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Wrap,
+    Block, Borders, Clear, List, ListItem, Paragraph, Wrap,
 };
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -42,7 +41,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::{App, ApprovalDecision, Mode, PendingApproval, RunState};
 use crate::claude::{EventReceiver, SpawnTarget, WicketConnection, WicketEvent};
-use crate::render::{render_entry, ACCENT, BASE, CODE, ERROR, FAINT, MUTED, WARNING};
+use crate::render::{render_entry, ACCENT, BASE, BG_ASSISTANT, BG_USER, CODE, ERROR, FAINT, MUTED, WARNING};
 use crate::tailer::run_tailer;
 
 fn init_tracing() -> WorkerGuard {
@@ -171,6 +170,9 @@ async fn main() -> Result<()> {
 
     let mut terminal = ratatui::init();
     let mut app = App::new(repl_mode);
+    if repl_mode {
+        app.slug = Some(positional.clone());
+    }
     let mut events = EventStream::new();
     let mut frame_interval = tokio::time::interval(Duration::from_millis(33));
 
@@ -182,69 +184,56 @@ async fn main() -> Result<()> {
 
                     let main_area;
                     let input_area;
+                    let status_area;
 
                     if app.repl_mode {
                         let layout = Layout::vertical([
                             Constraint::Min(0),
-                            Constraint::Length(3),
+                            Constraint::Length(1),
+                            Constraint::Length(1),
                         ])
                         .split(area);
                         main_area = layout[0];
                         input_area = Some(layout[1]);
+                        status_area = Some(layout[2]);
                     } else {
                         main_area = area;
                         input_area = None;
+                        status_area = None;
                     }
 
-                    let conv_chunks = Layout::horizontal([
-                        Constraint::Length(1),
-                        Constraint::Min(0),
-                        Constraint::Length(1),
-                    ])
-                    .split(main_area);
-
-                    let conv_width = conv_chunks[1].width;
+                    let conv_width = main_area.width;
                     let items: Vec<ListItem> = app
                         .entries
                         .iter()
                         .map(|entry| {
-                            let lines = render_entry(entry, conv_width);
+                            let (lines, bg) = render_entry(entry, conv_width);
                             ListItem::new(Text::from(lines))
+                                .style(Style::default().bg(bg))
                         })
                         .collect();
 
+                    // Fill the gap between the end of conversation content
+                    // and the input area with the last entry's background.
+                    let tail_bg = app.entries.last().map(|e| match e.kind {
+                        crate::model::EntryKind::User => BG_USER,
+                        crate::model::EntryKind::Assistant => BG_ASSISTANT,
+                    }).unwrap_or(BG_ASSISTANT);
                     let list = List::new(items)
-                        .block(Block::default().borders(Borders::NONE));
+                        .block(Block::default().borders(Borders::NONE).style(
+                            Style::default().bg(tail_bg)
+                        ));
 
-                    frame.render_stateful_widget(list, conv_chunks[1], &mut app.list_state);
-
-                    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-                    let mut scrollbar_state = ScrollbarState::new(app.entries.len())
-                        .position(app.list_state.selected().unwrap_or(0));
-                    frame.render_stateful_widget(
-                        scrollbar,
-                        conv_chunks[2],
-                        &mut scrollbar_state,
-                    );
+                    frame.render_stateful_widget(list, main_area, &mut app.list_state);
 
                     if let Some(input_rect) = input_area {
-                        let target_suffix = match &app.target_label {
-                            Some(label) => format!(" [{}] ", label),
-                            None => String::new(),
-                        };
-                        let title = match (&app.mode, &app.run_state) {
-                            (_, RunState::Running) => {
-                                format!(" running...{}", target_suffix)
-                            }
-                            (Mode::Input, RunState::Idle) => {
-                                format!(" prompt (esc: scroll){}", target_suffix)
-                            }
-                            (Mode::Scroll, RunState::Idle) => {
-                                format!(" scroll (i: input){}", target_suffix)
-                            }
+                        let text_style = match (&app.mode, &app.run_state) {
+                            (_, RunState::Running) => Style::default().fg(MUTED),
+                            (Mode::Input, RunState::Idle) => Style::default().fg(BASE),
+                            (Mode::Scroll, RunState::Idle) => Style::default().fg(MUTED),
                         };
 
-                        let border_style = if app.target_label.is_some() {
+                        let caret_style = if app.target_label.is_some() {
                             Style::default().fg(WARNING)
                         } else if app.mode == Mode::Input && app.run_state == RunState::Idle {
                             Style::default().fg(ACCENT)
@@ -252,21 +241,57 @@ async fn main() -> Result<()> {
                             Style::default().fg(FAINT)
                         };
 
-                        let text_style = match (&app.mode, &app.run_state) {
-                            (_, RunState::Running) => Style::default().fg(MUTED),
-                            (Mode::Input, RunState::Idle) => Style::default().fg(BASE),
-                            (Mode::Scroll, RunState::Idle) => Style::default().fg(MUTED),
-                        };
-
+                        // Input area with user background, no border.
+                        let input_bg = Style::default().bg(BG_USER);
                         let input_block = Block::default()
-                            .borders(Borders::ALL)
-                            .title(title)
-                            .border_style(border_style);
+                            .borders(Borders::NONE)
+                            .style(input_bg);
 
                         app.textarea.set_block(input_block);
-                        app.textarea.set_style(text_style);
+                        app.textarea.set_style(text_style.bg(BG_USER));
+                        app.textarea.set_cursor_line_style(Style::default().bg(BG_USER));
 
                         frame.render_widget(&app.textarea, input_rect);
+
+                        // Draw the › caret in the gutter area of the input.
+                        let caret_label = if app.run_state == RunState::Running {
+                            "…"
+                        } else {
+                            "\u{203a}"
+                        };
+                        let caret = Span::styled(
+                            format!("{} ", caret_label),
+                            caret_style.bg(BG_USER),
+                        );
+                        // Place the caret at the start of the input area.
+                        if input_rect.height > 0 {
+                            let caret_area = Rect::new(
+                                input_rect.x,
+                                input_rect.y,
+                                2,
+                                1,
+                            );
+                            frame.render_widget(
+                                Paragraph::new(Line::from(caret)),
+                                caret_area,
+                            );
+                        }
+                    }
+
+                    if let Some(status_rect) = status_area {
+                        let target_info = match &app.target_label {
+                            Some(label) => format!(" · {}", label),
+                            None => " · local".to_string(),
+                        };
+                        let status_text = format!("  {}{}",
+                            app.slug.as_deref().unwrap_or("puzzle"),
+                            target_info,
+                        );
+                        let status = Paragraph::new(Line::from(Span::styled(
+                            status_text,
+                            Style::default().fg(FAINT),
+                        )));
+                        frame.render_widget(status, status_rect);
                     }
 
                     if let Some(ref approval) = app.pending_approval {
