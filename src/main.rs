@@ -29,19 +29,19 @@ use std::time::Duration;
 use color_eyre::eyre::{bail, Result};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use futures::StreamExt;
+use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, Paragraph, Wrap,
-};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::{App, ApprovalDecision, Mode, PendingApproval, RunState};
 use crate::claude::{EventReceiver, SpawnTarget, WicketConnection, WicketEvent};
-use crate::render::{render_entry, ACCENT, BASE, BG_ASSISTANT, BG_USER, CODE, ERROR, FAINT, MUTED, WARNING};
+use crate::render::{render_entry, ACCENT, BASE, BG_USER, FAINT, MUTED, WARNING};
 use crate::tailer::run_tailer;
 
 fn init_tracing() -> WorkerGuard {
@@ -89,6 +89,36 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     Rect::new(x, y, w, h)
+}
+
+/// Render a conversation entry and insert it above the inline viewport,
+/// scrolling into the terminal's native scrollback.
+fn insert_entry(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    entry: &crate::model::ConversationEntry,
+) -> Result<()> {
+    let width = terminal.size()?.width;
+    let (lines, bg) = render_entry(entry, width);
+    let height = lines.len() as u16;
+
+    terminal.insert_before(height, |buf| {
+        // Fill the buffer with the entry background.
+        let area = buf.area;
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                buf[(x, y)].set_style(Style::default().bg(bg));
+            }
+        }
+        // Render each line.
+        for (i, line) in lines.into_iter().enumerate() {
+            if i as u16 >= area.height {
+                break;
+            }
+            let line_area = Rect::new(area.x, area.y + i as u16, area.width, 1);
+            line.render(line_area, buf);
+        }
+    })?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -168,7 +198,18 @@ async fn main() -> Result<()> {
         });
     }
 
-    let mut terminal = ratatui::init();
+    // Inline viewport: the input area lives at the bottom of the terminal.
+    // Conversation content is inserted above via insert_before, scrolling
+    // into tmux's native scrollback. No alternate screen.
+    crossterm::terminal::enable_raw_mode()?;
+    let backend = CrosstermBackend::new(std::io::stdout());
+    let viewport_height = if repl_mode { 3 } else { 0 };
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(viewport_height),
+        },
+    )?;
     let mut app = App::new(repl_mode);
     if repl_mode {
         app.slug = Some(positional.clone());
@@ -179,175 +220,143 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             _ = frame_interval.tick() => {
-                terminal.draw(|frame| {
-                    let area = frame.area();
+                if app.repl_mode {
+                    terminal.draw(|frame| {
+                        let area = frame.area();
 
-                    let main_area;
-                    let input_area;
-                    let status_area;
+                        if app.pending_approval.is_some() {
+                            // Approval mode: the viewport shows the dialog.
+                            // Same viewport, different face.
+                            let approval = app.pending_approval.as_ref().unwrap();
 
-                    if app.repl_mode {
-                        let layout = Layout::vertical([
-                            Constraint::Min(0),
-                            Constraint::Length(1),
-                            Constraint::Length(1),
-                        ])
-                        .split(area);
-                        main_area = layout[0];
-                        input_area = Some(layout[1]);
-                        status_area = Some(layout[2]);
-                    } else {
-                        main_area = area;
-                        input_area = None;
-                        status_area = None;
-                    }
-
-                    let conv_width = main_area.width;
-                    let items: Vec<ListItem> = app
-                        .entries
-                        .iter()
-                        .map(|entry| {
-                            let (lines, bg) = render_entry(entry, conv_width);
-                            ListItem::new(Text::from(lines))
-                                .style(Style::default().bg(bg))
-                        })
-                        .collect();
-
-                    // Fill the gap between the end of conversation content
-                    // and the input area with the last entry's background.
-                    let tail_bg = app.entries.last().map(|e| match e.kind {
-                        crate::model::EntryKind::User => BG_USER,
-                        crate::model::EntryKind::Assistant => BG_ASSISTANT,
-                    }).unwrap_or(BG_ASSISTANT);
-                    let list = List::new(items)
-                        .block(Block::default().borders(Borders::NONE).style(
-                            Style::default().bg(tail_bg)
-                        ));
-
-                    frame.render_stateful_widget(list, main_area, &mut app.list_state);
-
-                    if let Some(input_rect) = input_area {
-                        let text_style = match (&app.mode, &app.run_state) {
-                            (_, RunState::Running) => Style::default().fg(MUTED),
-                            (Mode::Input, RunState::Idle) => Style::default().fg(BASE),
-                            (Mode::Scroll, RunState::Idle) => Style::default().fg(MUTED),
-                        };
-
-                        let caret_style = if app.target_label.is_some() {
-                            Style::default().fg(WARNING)
-                        } else if app.mode == Mode::Input && app.run_state == RunState::Idle {
-                            Style::default().fg(ACCENT)
-                        } else {
-                            Style::default().fg(FAINT)
-                        };
-
-                        // Input area with user background, no border.
-                        let input_bg = Style::default().bg(BG_USER);
-                        let input_block = Block::default()
-                            .borders(Borders::NONE)
-                            .style(input_bg);
-
-                        app.textarea.set_block(input_block);
-                        app.textarea.set_style(text_style.bg(BG_USER));
-                        app.textarea.set_cursor_line_style(Style::default().bg(BG_USER));
-
-                        frame.render_widget(&app.textarea, input_rect);
-
-                        // Draw the › caret in the gutter area of the input.
-                        let caret_label = if app.run_state == RunState::Running {
-                            "…"
-                        } else {
-                            "\u{203a}"
-                        };
-                        let caret = Span::styled(
-                            format!("{} ", caret_label),
-                            caret_style.bg(BG_USER),
-                        );
-                        // Place the caret at the start of the input area.
-                        if input_rect.height > 0 {
-                            let caret_area = Rect::new(
-                                input_rect.x,
-                                input_rect.y,
-                                2,
-                                1,
+                            // Line 1: title question.
+                            let title = format!(
+                                "  Would you like to run {}?",
+                                approval.tool_name
                             );
+                            let r0 = Rect::new(area.x, area.y, area.width, 1);
                             frame.render_widget(
-                                Paragraph::new(Line::from(caret)),
-                                caret_area,
+                                Paragraph::new(Line::from(Span::styled(
+                                    title, Style::default().fg(WARNING),
+                                ))),
+                                r0,
                             );
-                        }
-                    }
 
-                    if let Some(status_rect) = status_area {
-                        let target_info = match &app.target_label {
-                            Some(label) => format!(" · {}", label),
-                            None => " · local".to_string(),
-                        };
-                        let status_text = format!("  {}{}",
-                            app.slug.as_deref().unwrap_or("puzzle"),
-                            target_info,
-                        );
-                        let status = Paragraph::new(Line::from(Span::styled(
-                            status_text,
-                            Style::default().fg(FAINT),
-                        )));
-                        frame.render_widget(status, status_rect);
-                    }
+                            // Line 2: the command/summary with $ prefix.
+                            let summary = if approval.input_summary.is_empty() {
+                                approval.tool_name.clone()
+                            } else {
+                                approval.input_summary.lines().next()
+                                    .unwrap_or(&approval.tool_name).to_string()
+                            };
+                            if area.height > 1 {
+                                let r1 = Rect::new(area.x, area.y + 1, area.width, 1);
+                                frame.render_widget(
+                                    Paragraph::new(Line::from(vec![
+                                        Span::styled("  $ ", Style::default().fg(MUTED)),
+                                        Span::styled(summary, Style::default().fg(BASE)),
+                                    ])),
+                                    r1,
+                                );
+                            }
 
-                    if let Some(ref approval) = app.pending_approval {
-                        let popup_area = centered_rect(area, 60, 16);
-                        frame.render_widget(Clear, popup_area);
+                            // Line 3: options.
+                            if area.height > 2 {
+                                let r2 = Rect::new(area.x, area.y + 2, area.width, 1);
+                                frame.render_widget(
+                                    Paragraph::new(Line::from(vec![
+                                        Span::styled("  y ", Style::default().fg(ACCENT)),
+                                        Span::styled("allow  ", Style::default().fg(BASE)),
+                                        Span::styled("n ", Style::default().fg(WARNING)),
+                                        Span::styled("deny", Style::default().fg(BASE)),
+                                    ])),
+                                    r2,
+                                );
+                            }
+                        } else {
+                            // Normal mode: input area + status bar.
+                            let layout = Layout::vertical([
+                                Constraint::Length(1),
+                                Constraint::Length(1),
+                                Constraint::Length(1),
+                            ])
+                            .split(area);
 
-                        let mut lines: Vec<Line> = vec![
-                            Line::from(""),
-                            Line::from(vec![
-                                Span::styled("  Tool: ", Style::default().fg(MUTED)),
+                            let input_rect = layout[1];
+                            let status_rect = layout[2];
+
+                            // Separator line.
+                            let sep = Paragraph::new(Line::from(Span::styled(
+                                "\u{2500}".repeat(area.width as usize),
+                                Style::default().fg(FAINT),
+                            )));
+                            frame.render_widget(sep, layout[0]);
+
+                            let text_style = match (&app.mode, &app.run_state) {
+                                (_, RunState::Running) => Style::default().fg(MUTED),
+                                (Mode::Input, RunState::Idle) => Style::default().fg(BASE),
+                                (Mode::Scroll, RunState::Idle) => Style::default().fg(MUTED),
+                            };
+
+                            let caret_style = if app.target_label.is_some() {
+                                Style::default().fg(WARNING)
+                            } else if app.mode == Mode::Input && app.run_state == RunState::Idle {
+                                Style::default().fg(ACCENT)
+                            } else {
+                                Style::default().fg(FAINT)
+                            };
+
+                            // Render the input as: caret + textarea content on one line.
+                            // No Block wrapper — tui-textarea renders directly.
+                            app.textarea.set_style(text_style.bg(BG_USER));
+                            app.textarea.set_cursor_line_style(Style::default().bg(BG_USER));
+
+                            // Caret in the gutter (columns 0-1).
+                            let caret_label = if app.run_state == RunState::Running {
+                                "\u{2026}"
+                            } else {
+                                "\u{203a}"
+                            };
+                            let caret_line = Line::from(vec![
                                 Span::styled(
-                                    approval.tool_name.clone(),
-                                    Style::default().fg(WARNING),
+                                    format!("{} ", caret_label),
+                                    caret_style.bg(BG_USER),
                                 ),
-                            ]),
-                            Line::from(""),
-                        ];
+                            ]).style(Style::default().bg(BG_USER));
+                            let caret_area = Rect::new(input_rect.x, input_rect.y, 2, 1);
+                            frame.render_widget(Paragraph::new(caret_line), caret_area);
 
-                        for line in approval.input_summary.lines().take(8) {
-                            lines.push(Line::from(Span::styled(
-                                format!("  {}", line),
-                                Style::default().fg(BASE),
+                            // Textarea starts at column 2.
+                            let ta_rect = Rect::new(
+                                input_rect.x + 2,
+                                input_rect.y,
+                                input_rect.width.saturating_sub(2),
+                                input_rect.height,
+                            );
+                            frame.render_widget(&app.textarea, ta_rect);
+
+                            // Status bar.
+                            let target_info = match &app.target_label {
+                                Some(label) => format!(" \u{00b7} {}", label),
+                                None => " \u{00b7} local".to_string(),
+                            };
+                            let status_text = format!("  {}{}",
+                                app.slug.as_deref().unwrap_or("puzzle"),
+                                target_info,
+                            );
+                            let status = Paragraph::new(Line::from(Span::styled(
+                                status_text,
+                                Style::default().fg(FAINT),
                             )));
+                            frame.render_widget(status, status_rect);
                         }
-                        let total_lines = approval.input_summary.lines().count();
-                        if total_lines > 8 {
-                            lines.push(Line::from(Span::styled(
-                                format!("  ... ({} more lines)", total_lines - 8),
-                                Style::default().fg(MUTED),
-                            )));
-                        }
-
-                        lines.push(Line::from(""));
-                        lines.push(Line::from(vec![
-                            Span::styled("  [y] ", Style::default().fg(CODE)),
-                            Span::styled("Allow  ", Style::default().fg(BASE)),
-                            Span::styled("[n] ", Style::default().fg(ERROR)),
-                            Span::styled("Deny", Style::default().fg(BASE)),
-                        ]));
-
-                        let dialog = Paragraph::new(lines)
-                            .block(
-                                Block::default()
-                                    .borders(Borders::ALL)
-                                    .title(" Approve? ")
-                                    .border_style(Style::default().fg(WARNING)),
-                            )
-                            .wrap(Wrap { trim: false });
-
-                        frame.render_widget(dialog, popup_area);
-                    }
-                })?;
+                    })?;
+                }
             }
 
             // Viewer mode: tailer entries.
             Some(entry) = rx.recv() => {
+                insert_entry(&mut terminal, &entry)?;
                 app.push_entry(entry);
             }
 
@@ -363,6 +372,7 @@ async fn main() -> Result<()> {
                                 "total": app.entries.len() + 1,
                             }));
                         }
+                        insert_entry(&mut terminal, &entry)?;
                         app.push_entry(entry);
                     }
                     Some(WicketEvent::Lifecycle(event_name)) => {
@@ -406,7 +416,14 @@ async fn main() -> Result<()> {
                             .to_string();
                         let input = data
                             .get("input")
-                            .map(|v| serde_json::to_string_pretty(v).unwrap_or_default())
+                            .map(|v| {
+                                // For Bash, show the command directly.
+                                if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+                                    cmd.to_string()
+                                } else {
+                                    serde_json::to_string_pretty(v).unwrap_or_default()
+                                }
+                            })
                             .unwrap_or_default();
                         tracing::info!(tool = %tool_name, "approval request");
                         if let Some(ref conn) = wicket {
@@ -543,7 +560,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    ratatui::restore();
+    crossterm::terminal::disable_raw_mode()?;
 
     // Disconnect from Wicket.
     if let Some(conn) = wicket {
