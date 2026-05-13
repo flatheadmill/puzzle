@@ -41,7 +41,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::{App, ApprovalDecision, Mode, PendingApproval, RunState};
 use crate::claude::{EventReceiver, SpawnTarget, WicketConnection, WicketEvent};
-use crate::render::{render_entry, ACCENT, BASE, BG_USER, FAINT, MUTED, WARNING};
+use crate::render::{render_entry, ACCENT, BASE, BG_ASSISTANT, BG_THINKING, BG_USER, FAINT, GLYPH_ASSISTANT_COLOR, GUTTER, MUTED, THINKING, WARNING};
 use crate::tailer::run_tailer;
 
 fn init_tracing() -> WorkerGuard {
@@ -89,6 +89,57 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     Rect::new(x, y, w, h)
+}
+
+/// Render a conversation entry and insert it above the inline viewport,
+/// Insert wrapped streaming text lines above the viewport.
+fn insert_streaming_lines(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    text: &str,
+    glyph: Span<'static>,
+    style: Style,
+    bg: ratatui::style::Color,
+) -> Result<()> {
+    let width = terminal.size()?.width as usize;
+    let available = width.saturating_sub(4); // 2ch glyph + 2ch right margin
+    let wrapped = textwrap::wrap(text, available);
+    let mut first = true;
+
+    for wline in &wrapped {
+        let prefix = if first {
+            first = false;
+            glyph.clone()
+        } else {
+            Span::raw("  ")
+        };
+        let line = Line::from(vec![
+            prefix,
+            Span::styled(wline.to_string(), style),
+        ]);
+        terminal.insert_before(1, |buf| {
+            let area = buf.area;
+            for y in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    buf[(x, y)].set_style(Style::default().bg(bg));
+                }
+            }
+            line.render(area, buf);
+        })?;
+    }
+
+    // If text was empty, still insert a blank line with the background.
+    if wrapped.is_empty() {
+        terminal.insert_before(1, |buf| {
+            let area = buf.area;
+            for y in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    buf[(x, y)].set_style(Style::default().bg(bg));
+                }
+            }
+        })?;
+    }
+
+    Ok(())
 }
 
 /// Render a conversation entry and insert it above the inline viewport,
@@ -216,6 +267,12 @@ async fn main() -> Result<()> {
     }
     let mut events = EventStream::new();
     let mut frame_interval = tokio::time::interval(Duration::from_millis(33));
+
+    // Streaming state: accumulate deltas and flush complete lines.
+    let mut stream_buf = String::new();
+    let mut stream_block_type: Option<String> = None; // "text" or "thinking"
+    let mut stream_first_line = true; // first line of a streaming block gets the glyph
+    let mut streaming = false;
 
     loop {
         tokio::select! {
@@ -364,16 +421,194 @@ async fn main() -> Result<()> {
             event = recv_wicket(&mut wicket_rx) => {
                 match event {
                     Some(WicketEvent::Entry(entry)) => {
-                        if let Some(ref conn) = wicket {
-                            conn.log("info", "entry received", serde_json::json!({
-                                "kind": format!("{:?}", entry.kind),
-                                "blocks": entry.blocks.len(),
-                                "seq": entry.seq,
-                                "total": app.entries.len() + 1,
-                            }));
+                        // If we were streaming, skip this entry — content
+                        // is already in the scrollback from the deltas.
+                        if streaming {
+                            // Flush any remaining buffer.
+                            if !stream_buf.is_empty() {
+                                let bg = BG_ASSISTANT;
+                                let style = if stream_block_type.as_deref() == Some("thinking") {
+                                    Style::default().fg(THINKING)
+                                } else {
+                                    Style::default().fg(BASE)
+                                };
+                                insert_streaming_lines(
+                                    &mut terminal, &stream_buf, Span::raw("  "), style, bg,
+                                )?;
+                                stream_buf.clear();
+                            }
+                            // The text was already streamed, but thinking blocks
+                            // only arrive through the transcript. Render them now.
+                            let width = terminal.size()?.width;
+                            for block in &entry.blocks {
+                                if let crate::model::ContentBlock::Thinking { text } = block {
+                                    let content_width = width.saturating_sub(4);
+                                    let available = (content_width as usize).saturating_sub(2).max(1);
+                                    // Thinking label
+                                    let label_line = Line::from(vec![
+                                        Span::styled("\u{2502} ", Style::default().fg(GUTTER)),
+                                        Span::styled("thinking", Style::default().fg(GUTTER).add_modifier(ratatui::style::Modifier::ITALIC)),
+                                    ]);
+                                    terminal.insert_before(1, |buf| {
+                                        let area = buf.area;
+                                        for y in area.top()..area.bottom() {
+                                            for x in area.left()..area.right() {
+                                                buf[(x, y)].set_style(Style::default().bg(BG_THINKING));
+                                            }
+                                        }
+                                        label_line.render(area, buf);
+                                    })?;
+                                    // Thinking text
+                                    for text_line in text.lines() {
+                                        if text_line.is_empty() {
+                                            terminal.insert_before(1, |buf| {
+                                                let area = buf.area;
+                                                for y in area.top()..area.bottom() {
+                                                    for x in area.left()..area.right() {
+                                                        buf[(x, y)].set_style(Style::default().bg(BG_THINKING));
+                                                    }
+                                                }
+                                                let l = Line::from(Span::styled("\u{2502}", Style::default().fg(GUTTER)));
+                                                l.render(area, buf);
+                                            })?;
+                                        } else {
+                                            for wrapped in textwrap::wrap(text_line, available) {
+                                                let l = Line::from(vec![
+                                                    Span::styled("\u{2502} ", Style::default().fg(GUTTER)),
+                                                    Span::styled(wrapped.into_owned(), Style::default().fg(THINKING)),
+                                                ]);
+                                                terminal.insert_before(1, |buf| {
+                                                    let area = buf.area;
+                                                    for y in area.top()..area.bottom() {
+                                                        for x in area.left()..area.right() {
+                                                            buf[(x, y)].set_style(Style::default().bg(BG_THINKING));
+                                                        }
+                                                    }
+                                                    l.render(area, buf);
+                                                })?;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            streaming = false;
+                            stream_first_line = true;
+                            stream_block_type = None;
+                            app.push_entry(entry);
+                        } else {
+                            if let Some(ref conn) = wicket {
+                                conn.log("info", "entry received", serde_json::json!({
+                                    "kind": format!("{:?}", entry.kind),
+                                    "blocks": entry.blocks.len(),
+                                    "seq": entry.seq,
+                                    "total": app.entries.len() + 1,
+                                }));
+                            }
+                            insert_entry(&mut terminal, &entry)?;
+                            app.push_entry(entry);
                         }
-                        insert_entry(&mut terminal, &entry)?;
-                        app.push_entry(entry);
+                    }
+                    Some(WicketEvent::Delta(delta)) => {
+                        let delta_type = delta.get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+
+                        match delta_type {
+                            "content_block_start" => {
+                                let block_type = delta.get("content_block")
+                                    .and_then(|b| b.get("type"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("text")
+                                    .to_string();
+                                stream_block_type = Some(block_type);
+                                stream_buf.clear();
+                                streaming = true;
+
+                                // Insert top padding for the entry band.
+                                if stream_first_line {
+                                    let bg = BG_ASSISTANT;
+                                    terminal.insert_before(1, |buf| {
+                                        let area = buf.area;
+                                        for y in area.top()..area.bottom() {
+                                            for x in area.left()..area.right() {
+                                                buf[(x, y)].set_style(Style::default().bg(bg));
+                                            }
+                                        }
+                                    })?;
+                                }
+                            }
+                            "content_block_delta" => {
+                                let text = delta.get("delta")
+                                    .and_then(|d| {
+                                        d.get("text").or_else(|| d.get("thinking"))
+                                    })
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+
+                                stream_buf.push_str(text);
+
+                                // Flush complete lines.
+                                while let Some(pos) = stream_buf.find('\n') {
+                                    let line_text = stream_buf[..pos].to_string();
+                                    stream_buf = stream_buf[pos + 1..].to_string();
+
+                                    let bg = if stream_block_type.as_deref() == Some("thinking") {
+                                        BG_THINKING
+                                    } else {
+                                        BG_ASSISTANT
+                                    };
+
+                                    let (glyph, style) = if stream_block_type.as_deref() == Some("thinking") {
+                                        (
+                                            Span::styled("\u{2502} ", Style::default().fg(GUTTER)),
+                                            Style::default().fg(THINKING),
+                                        )
+                                    } else {
+                                        let g = if stream_first_line {
+                                            Span::styled("\u{00b7} ", Style::default().fg(GLYPH_ASSISTANT_COLOR))
+                                        } else {
+                                            Span::raw("  ")
+                                        };
+                                        (g, Style::default().fg(BASE))
+                                    };
+                                    stream_first_line = false;
+
+                                    insert_streaming_lines(
+                                        &mut terminal, &line_text, glyph, style, bg,
+                                    )?;
+                                }
+                            }
+                            "content_block_stop" => {
+                                // Flush remaining buffer.
+                                if !stream_buf.is_empty() {
+                                    let bg = if stream_block_type.as_deref() == Some("thinking") {
+                                        BG_THINKING
+                                    } else {
+                                        BG_ASSISTANT
+                                    };
+                                    let style = if stream_block_type.as_deref() == Some("thinking") {
+                                        Style::default().fg(THINKING)
+                                    } else {
+                                        Style::default().fg(BASE)
+                                    };
+                                    let glyph = if stream_first_line && stream_block_type.as_deref() != Some("thinking") {
+                                        Span::styled("\u{00b7} ", Style::default().fg(GLYPH_ASSISTANT_COLOR))
+                                    } else if stream_block_type.as_deref() == Some("thinking") {
+                                        Span::styled("\u{2502} ", Style::default().fg(GUTTER))
+                                    } else {
+                                        Span::raw("  ")
+                                    };
+                                    stream_first_line = false;
+
+                                    insert_streaming_lines(
+                                        &mut terminal, &stream_buf, glyph, style, bg,
+                                    )?;
+                                    stream_buf.clear();
+                                }
+                                stream_block_type = None;
+                            }
+                            _ => {}
+                        }
                     }
                     Some(WicketEvent::Lifecycle(event_name)) => {
                         match event_name.as_str() {

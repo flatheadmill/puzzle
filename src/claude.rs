@@ -39,6 +39,7 @@ pub enum SpawnTarget {
 
 pub enum WicketEvent {
     Entry(ConversationEntry),
+    Delta(Value),
     Lifecycle(String),
     Approval(Value),
     Meta(Value),
@@ -131,6 +132,7 @@ impl WicketConnection {
                                 WicketEvent::Lifecycle(event_name)
                             }
                             "approval" => WicketEvent::Approval(envelope.data),
+                            "delta" => WicketEvent::Delta(envelope.data),
                             "meta" => WicketEvent::Meta(envelope.data),
                             "error" => {
                                 let msg = envelope

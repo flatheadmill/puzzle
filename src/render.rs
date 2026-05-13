@@ -42,14 +42,14 @@ pub const WARNING: Color = Color::Rgb(210, 160, 60);     // approval dialog, sto
 pub const ERROR: Color = Color::Rgb(200, 100, 90);       // errors, warm not screaming
 pub const CODE: Color = Color::Rgb(150, 180, 140);       // inline code, subtle sage
 const CODE_BLOCK: Color = Color::Rgb(175, 175, 170);     // code blocks, near-base
-const GUTTER: Color = Color::Rgb(70, 100, 130);          // thinking gutter, dim steel
+pub const GUTTER: Color = Color::Rgb(70, 100, 130);      // thinking gutter, dim steel
 
 // Glyph markers for the left rail.
 const GLYPH_USER: &str = "\u{203a} ";                    // › for user (types at the caret)
 const GLYPH_ASSISTANT: &str = "\u{00b7} ";               // · for assistant
 const GLYPH_THINKING: &str = "\u{2502} ";                // │ for thinking blocks
 const GLYPH_USER_COLOR: Color = Color::Rgb(130, 130, 135);
-const GLYPH_ASSISTANT_COLOR: Color = Color::Rgb(120, 120, 125);
+pub const GLYPH_ASSISTANT_COLOR: Color = Color::Rgb(120, 120, 125);
 
 // Background bands for entry types.
 pub const BG_USER: Color = Color::Rgb(30, 30, 32);
