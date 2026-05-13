@@ -153,18 +153,33 @@ fn render_thinking(lines: &mut Vec<Line<'static>>, text: &str, width: u16) {
 
 fn render_text(lines: &mut Vec<Line<'static>>, text: &str, kind: &EntryKind, width: u16, show_glyph: bool) {
     match kind {
-        EntryKind::User => {
-            let style = Style::default().fg(BASE);
-            for (i, line) in text.lines().enumerate() {
-                let glyph = if i == 0 && show_glyph {
-                    Span::styled(GLYPH_USER, Style::default().fg(GLYPH_USER_COLOR))
-                } else {
-                    Span::raw("  ")
-                };
-                lines.push(Line::from(vec![
-                    glyph,
-                    Span::styled(line.to_string(), style),
-                ]));
+       EntryKind::User => {
+           let style = Style::default().fg(BASE);
+            let available = (width as usize).saturating_sub(2).max(1);
+            let mut first = show_glyph;
+            for line in text.lines() {
+                if line.is_empty() {
+                    let glyph = if first {
+                        first = false;
+                        Span::styled(GLYPH_USER, Style::default().fg(GLYPH_USER_COLOR))
+                    } else {
+                        Span::raw("  ")
+                    };
+                    lines.push(Line::from(vec![glyph]));
+                    continue;
+                }
+                for (j, wrapped) in textwrap::wrap(line, available).into_iter().enumerate() {
+                    let glyph = if first && j == 0 {
+                        Span::styled(GLYPH_USER, Style::default().fg(GLYPH_USER_COLOR))
+                    } else {
+                        Span::raw("  ")
+                    };
+                    lines.push(Line::from(vec![
+                        glyph,
+                        Span::styled(wrapped.into_owned(), style),
+                    ]));
+                }
+                if first { first = false; }
             }
         }
         EntryKind::Assistant => {
