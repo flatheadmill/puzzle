@@ -22,6 +22,7 @@ mod config;
 mod model;
 mod render;
 mod tailer;
+mod textarea;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -254,11 +255,11 @@ async fn main() -> Result<()> {
     // into tmux's native scrollback. No alternate screen.
     crossterm::terminal::enable_raw_mode()?;
     let backend = CrosstermBackend::new(std::io::stdout());
-    let viewport_height = if repl_mode { 3 } else { 0 };
+    let base_viewport_height: u16 = if repl_mode { 3 } else { 0 };
     let mut terminal = Terminal::with_options(
         backend,
         TerminalOptions {
-            viewport: Viewport::Inline(viewport_height),
+            viewport: Viewport::Inline(base_viewport_height),
         },
     )?;
     let mut app = App::new(repl_mode);
@@ -278,6 +279,22 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = frame_interval.tick() => {
                 if app.repl_mode {
+                    // Dynamic viewport: grow/shrink to fit textarea content.
+                    let term_width = terminal.size().map(|s| s.width).unwrap_or(80);
+                    let ta_width = term_width.saturating_sub(2);
+                    let ta_height = app.textarea.desired_height(ta_width).max(1).min(6);
+                    let desired_viewport = ta_height + 2; // separator + status
+                    let current_area = terminal.get_frame().area();
+                    if current_area.height != desired_viewport {
+                        let new_area = Rect::new(
+                            current_area.x,
+                            current_area.y + current_area.height.saturating_sub(desired_viewport),
+                            current_area.width,
+                            desired_viewport,
+                        );
+                        terminal.set_viewport_area(new_area);
+                    }
+
                     terminal.draw(|frame| {
                         let area = frame.area();
 
@@ -330,11 +347,11 @@ async fn main() -> Result<()> {
                                     r2,
                                 );
                             }
-                        } else {
-                            // Normal mode: input area + status bar.
+                       } else {
+                           // Normal mode: input area + status bar.
                             let layout = Layout::vertical([
                                 Constraint::Length(1),
-                                Constraint::Length(1),
+                                Constraint::Fill(1),
                                 Constraint::Length(1),
                             ])
                             .split(area);
@@ -365,8 +382,14 @@ async fn main() -> Result<()> {
 
                             // Render the input as: caret + textarea content on one line.
                             // No Block wrapper — tui-textarea renders directly.
-                            app.textarea.set_style(text_style.bg(BG_USER));
-                            app.textarea.set_cursor_line_style(Style::default().bg(BG_USER));
+                           app.textarea.set_style(text_style.bg(BG_USER));
+                            app.textarea.set_cursor_style(
+                                if app.mode == Mode::Input && app.run_state == RunState::Idle {
+                                    Style::default().bg(BG_USER).add_modifier(ratatui::style::Modifier::REVERSED)
+                                } else {
+                                    text_style.bg(BG_USER)
+                                }
+                            );
 
                             // Caret in the gutter (columns 0-1).
                             let caret_label = if app.run_state == RunState::Running {
@@ -390,7 +413,7 @@ async fn main() -> Result<()> {
                                 input_rect.width.saturating_sub(2),
                                 input_rect.height,
                             );
-                            frame.render_widget(&app.textarea, ta_rect);
+                            app.textarea.render(ta_rect, frame.buffer_mut(), &mut app.textarea_state);
 
                             // Status bar.
                             let target_info = match &app.target_label {

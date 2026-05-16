@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ratatui = "0.29"
+ratatui = { git = "https://github.com/nornagon/ratatui", rev = "9b2ad1298408c45918ee9f8241a6f95498cdbed2" }
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -16,12 +16,15 @@ textwrap = "0.16"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-tui-textarea = "0.7"
 pulldown-cmark = "0.9"
-unicode-width = "0.1"
+unicode-width = "0.2"
+unicode-segmentation = "1.10"
 uuid = { version = "1", features = ["v4"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+
+[patch.crates-io]
+ratatui = { git = "https://github.com/nornagon/ratatui", rev = "9b2ad1298408c45918ee9f8241a6f95498cdbed2" }

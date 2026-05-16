@@ -17,9 +17,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::ListState;
-use tui_textarea::{Input, TextArea};
 
 use crate::model::{ContentBlock, ConversationEntry};
+use crate::textarea::TextArea;
+use crate::textarea::TextAreaState;
 
 #[derive(PartialEq)]
 pub enum Mode {
@@ -51,7 +52,7 @@ pub struct App {
     pub should_quit: bool,
     pub mode: Mode,
     pub run_state: RunState,
-    pub textarea: TextArea<'static>,
+    pub textarea: TextArea,
     pub repl_mode: bool,
     /// Shown in the prompt bar when a remote target is active. The border
     /// goes yellow and the label appears as [yolo] or [user@host] so the
@@ -63,11 +64,11 @@ pub struct App {
     /// sets approval_decision for the event loop to act on.
     pub pending_approval: Option<PendingApproval>,
     pub approval_decision: Option<ApprovalDecision>,
+    pub textarea_state: TextAreaState,
 }
 
-fn new_textarea() -> TextArea<'static> {
-    let mut textarea = TextArea::default();
-    textarea.set_cursor_line_style(Style::default());
+fn new_textarea() -> TextArea {
+    let mut textarea = TextArea::new();
     textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
     textarea
 }
@@ -89,6 +90,7 @@ impl App {
             slug: None,
             pending_approval: None,
             approval_decision: None,
+            textarea_state: TextAreaState::default(),
         }
     }
 
@@ -110,7 +112,7 @@ impl App {
     }
 
     pub fn submit_input(&mut self) -> Option<String> {
-        let content = self.textarea.lines().join("\n");
+        let content = self.textarea.text().to_string();
         if content.trim().is_empty() {
             return None;
         }
@@ -155,7 +157,7 @@ impl App {
             }
             _ => {
                 if self.run_state != RunState::Running {
-                    self.textarea.input(Input::from(key));
+                    self.textarea.input(key);
                 }
             }
         }
