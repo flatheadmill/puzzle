@@ -6,20 +6,22 @@
 // Translates between the two protocols.
 
 mod exchange;
+mod translate;
 mod wicket;
 
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use color_eyre::eyre::{bail, Result};
+use color_eyre::eyre::Result;
 use tokio::net::UnixListener;
 use tokio::process::Command;
+use tokio_tungstenite::accept_async;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::exchange::ExchangeLog;
 
-fn init_tracing(slug: &str) -> WorkerGuard {
+fn init_tracing() -> WorkerGuard {
     let home = std::env::var("HOME").expect("HOME not set");
     let log_dir = std::path::Path::new(&home)
         .join(".local/state/puzzle");
@@ -52,7 +54,6 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    // Parse: puzzle <slug> [--codex <path>]
     let slug = args.get(1).cloned().unwrap_or_else(|| {
         eprintln!("usage: puzzle <slug> [--codex <path>]");
         std::process::exit(1);
@@ -69,7 +70,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let _guard = init_tracing(&slug);
+    let _guard = init_tracing();
     tracing::info!(slug = %slug, "puzzle starting");
 
     let home = std::env::var("HOME")?;
@@ -93,32 +94,32 @@ async fn main() -> Result<()> {
 
     // Launch the Codex TUI.
     let codex_bin = codex_path.unwrap_or_else(|| "codex-tui".to_string());
-    let socket_url = format!("unix://{}", socket_path.display());
-    tracing::info!(bin = %codex_bin, socket = %socket_url, "launching codex TUI");
+    let socket_arg = format!("unix://{}", socket_path.display());
+    tracing::info!(bin = %codex_bin, socket = %socket_arg, "launching codex TUI");
 
     let mut tui_child = Command::new(&codex_bin)
         .arg("--remote")
-        .arg(&socket_url)
+        .arg(&socket_arg)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    // Accept the TUI's WebSocket connection.
+    // Accept the TUI's connection and upgrade to WebSocket.
     tracing::info!("waiting for TUI connection");
     let (stream, _addr) = listener.accept().await?;
-    tracing::info!("TUI connected");
+    let ws_stream = accept_async(stream).await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    tracing::info!("TUI connected, websocket established");
 
-    // Upgrade to WebSocket.
-    // For now, just log that we got a connection and wait for the TUI to exit.
-    // The protocol translation loop goes here.
-    tracing::info!("TODO: protocol translation loop");
+    // Run the translation loop.
+    translate::run(ws_stream, wicket, exchange, &slug).await?;
 
     // Wait for the TUI to exit.
     let status = tui_child.wait().await?;
     tracing::info!(code = ?status.code(), "codex TUI exited");
 
-    // Clean up the socket.
+    // Clean up.
     let _ = std::fs::remove_file(&socket_path);
 
     Ok(())
