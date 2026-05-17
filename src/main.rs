@@ -91,10 +91,28 @@ async fn main() -> Result<()> {
     let listener = UnixListener::bind(&socket_path)?;
     tracing::info!(path = %socket_path.display(), "listening for codex TUI");
 
-    // Connect to Wicket.
+    // Connect to Wicket and drain history before launching the TUI.
     let wicket_url = "ws://127.0.0.1:6502";
-    let wicket = wicket::WicketClient::connect(wicket_url, &slug).await?;
+    let mut wicket = wicket::WicketClient::connect(wicket_url, &slug).await?;
     tracing::info!("connected to wicket");
+
+    // Collect all history entries from Wicket. They arrive in a burst
+    // on connect. Wait for 200ms of silence to know the burst is done.
+    let mut history: Vec<serde_json::Value> = vec![];
+    loop {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            wicket.event_rx.recv(),
+        ).await {
+            Ok(Some(wicket::WicketEvent::Entry(entry))) => {
+                history.push(entry);
+            }
+            Ok(Some(_)) => {} // non-entry events during history load
+            Ok(None) => break,
+            Err(_) => break, // timeout — history burst is done
+        }
+    }
+    tracing::info!(entries = history.len(), "wicket history loaded");
 
     // Launch the Codex TUI with CODEX_HOME pointing to our directory.
     let codex_bin = codex_path.unwrap_or_else(|| "codex-tui".to_string());
@@ -124,8 +142,8 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Run the translation loop.
-    translate::run(ws_stream, wicket, exchange, &slug).await?;
+    // Run the translation loop with pre-loaded history.
+    translate::run(ws_stream, wicket, exchange, &slug, history).await?;
 
     // Wait for the TUI to exit.
     let status = tui_child.wait().await?;
