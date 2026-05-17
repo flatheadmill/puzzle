@@ -75,7 +75,14 @@ pub async fn run(
                         };
 
                         let method = rpc.method.as_deref().unwrap_or("");
-                        let id = rpc.id.clone().unwrap_or(Value::Null);
+                        let id = rpc.id.clone();
+
+                        // Notifications have no id — acknowledge silently.
+                        if id.is_none() {
+                            tracing::debug!(method, "TUI notification (no response needed)");
+                            continue;
+                        }
+                        let id = id.unwrap_or(Value::Null);
 
                         match method {
                             "initialize" => {
@@ -101,7 +108,7 @@ pub async fn run(
                                 tracing::info!(method, "TUI: thread request");
                                 // TODO: build response from Wicket history.
                                 // For now, return an empty thread.
-                                let thread_id = format!("puzzle-{}", slug);
+                                let thread_id = uuid::Uuid::new_v4().to_string();
                                 let home = std::env::var("HOME").unwrap_or_default();
                                 let cwd = format!("{}/pane/{}", home, slug);
                                 let response = JsonRpcResponse {
@@ -110,13 +117,13 @@ pub async fn run(
                                     result: serde_json::json!({
                                         "thread": {
                                             "id": thread_id,
-                                            "sessionId": thread_id,
+                                            "sessionId": uuid::Uuid::new_v4().to_string(),
                                             "preview": "",
                                             "ephemeral": false,
                                             "modelProvider": "anthropic",
                                             "createdAt": 0,
                                             "updatedAt": 0,
-                                            "status": "idle",
+                                            "status": { "type": "idle" },
                                             "cwd": cwd,
                                             "cliVersion": "0.1.0",
                                             "source": "cli",
@@ -125,10 +132,56 @@ pub async fn run(
                                         "model": "claude-opus-4-6",
                                         "modelProvider": "anthropic",
                                         "cwd": cwd,
-                                        "approvalPolicy": "onFailure",
-                                        "approvalsReviewer": "guardian",
-                                        "sandbox": "danger-full-access",
+                                        "approvalPolicy": "on-failure",
+                                        "approvalsReviewer": "user",
+                                        "sandbox": { "type": "dangerFullAccess" },
                                         "instructionSources": []
+                                    }),
+                                };
+                                let resp_json = serde_json::to_string(&response)?;
+                                exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&resp_json)?);
+                                tui_sink.send(Message::text(resp_json)).await?;
+                            }
+
+                            "account/read" => {
+                                tracing::info!("TUI: account/read");
+                                let response = JsonRpcResponse {
+                                    jsonrpc: "2.0".into(),
+                                    id,
+                                    result: serde_json::json!({
+                                        "account": {
+                                            "type": "apiKey"
+                                        },
+                                        "requiresOpenaiAuth": false
+                                    }),
+                                };
+                                let resp_json = serde_json::to_string(&response)?;
+                                exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&resp_json)?);
+                                tui_sink.send(Message::text(resp_json)).await?;
+                            }
+
+                            "model/list" => {
+                                tracing::info!("TUI: model/list");
+                                let response = JsonRpcResponse {
+                                    jsonrpc: "2.0".into(),
+                                    id,
+                                    result: serde_json::json!({
+                                        "data": [{
+                                            "id": "claude-opus-4-6",
+                                            "model": "claude-opus-4-6",
+                                            "displayName": "Claude Opus 4.6",
+                                            "description": "Anthropic Claude Opus 4.6",
+                                            "hidden": false,
+                                            "supportedReasoningEfforts": [
+                                                { "reasoningEffort": "high", "description": "High" }
+                                            ],
+                                            "defaultReasoningEffort": "high",
+                                            "inputModalities": ["text", "image"],
+                                            "supportsPersonality": false,
+                                            "serviceTiers": [],
+                                            "isDefault": true
+                                        }],
+                                        "nextCursor": null
                                     }),
                                 };
                                 let resp_json = serde_json::to_string(&response)?;

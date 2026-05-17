@@ -79,8 +79,12 @@ async fn main() -> Result<()> {
 
     let exchange = ExchangeLog::new(&slug);
 
-    // Unix socket for the Codex TUI to connect to.
-    let socket_path = pane_dir.join("puzzle.sock");
+    // Set up CODEX_HOME so the TUI discovers our socket.
+    // The socket goes at <codex_home>/app-server-control/app-server-control.sock
+    let codex_home = pane_dir.join(".codex");
+    let socket_dir = codex_home.join("app-server-control");
+    std::fs::create_dir_all(&socket_dir)?;
+    let socket_path = socket_dir.join("app-server-control.sock");
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
     }
@@ -92,25 +96,33 @@ async fn main() -> Result<()> {
     let wicket = wicket::WicketClient::connect(wicket_url, &slug).await?;
     tracing::info!("connected to wicket");
 
-    // Launch the Codex TUI.
+    // Launch the Codex TUI with CODEX_HOME pointing to our directory.
     let codex_bin = codex_path.unwrap_or_else(|| "codex-tui".to_string());
-    let socket_arg = format!("unix://{}", socket_path.display());
-    tracing::info!(bin = %codex_bin, socket = %socket_arg, "launching codex TUI");
+    tracing::info!(bin = %codex_bin, codex_home = %codex_home.display(), "launching codex TUI");
 
     let mut tui_child = Command::new(&codex_bin)
-        .arg("--remote")
-        .arg(&socket_arg)
+        .env("CODEX_HOME", &codex_home)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
 
     // Accept the TUI's connection and upgrade to WebSocket.
+    // The TUI probes the socket first (a bare TCP connect to check liveness),
+    // then does the real WebSocket connection. Loop until handshake succeeds.
     tracing::info!("waiting for TUI connection");
-    let (stream, _addr) = listener.accept().await?;
-    let ws_stream = accept_async(stream).await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    tracing::info!("TUI connected, websocket established");
+    let ws_stream = loop {
+        let (stream, _addr) = listener.accept().await?;
+        match accept_async(stream).await {
+            Ok(ws) => {
+                tracing::info!("TUI connected, websocket established");
+                break ws;
+            }
+            Err(e) => {
+                tracing::debug!("probe or failed handshake, retrying: {}", e);
+            }
+        }
+    };
 
     // Run the translation loop.
     translate::run(ws_stream, wicket, exchange, &slug).await?;
