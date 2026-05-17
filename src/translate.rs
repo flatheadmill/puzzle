@@ -189,6 +189,20 @@ pub async fn run(
                                 tui_sink.send(Message::text(resp_json)).await?;
                             }
 
+                            "skills/list" => {
+                                tracing::info!("TUI: skills/list");
+                                let response = JsonRpcResponse {
+                                    jsonrpc: "2.0".into(),
+                                    id,
+                                    result: serde_json::json!({
+                                        "data": []
+                                    }),
+                                };
+                                let resp_json = serde_json::to_string(&response)?;
+                                exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&resp_json)?);
+                                tui_sink.send(Message::text(resp_json)).await?;
+                            }
+
                             _ => {
                                 tracing::info!(method, "TUI: unhandled method");
                                 let error = JsonRpcError {
