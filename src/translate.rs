@@ -184,6 +184,7 @@ pub async fn run(
     exchange: ExchangeLog,
     slug: &str,
     history: Vec<Value>,
+    initial_usage: Option<Value>,
 ) -> color_eyre::eyre::Result<()> {
     let (mut tui_sink, mut tui_stream) = tui_ws.split();
 
@@ -283,6 +284,40 @@ pub async fn run(
                                     "sandbox": { "type": "dangerFullAccess" },
                                     "instructionSources": []
                                 })).await?;
+
+                                if let Some(ref usage) = initial_usage {
+                                    let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                                    let cached = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                                    let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                                    let total = input + cached + output;
+                                    let notif = JsonRpcNotification {
+                                        jsonrpc: "2.0".into(),
+                                        method: "thread/tokenUsage/updated".into(),
+                                        params: serde_json::json!({
+                                            "threadId": thread_id,
+                                            "turnId": "",
+                                            "tokenUsage": {
+                                                "total": {
+                                                    "totalTokens": total,
+                                                    "inputTokens": input + cached,
+                                                    "cachedInputTokens": cached,
+                                                    "outputTokens": output,
+                                                    "reasoningOutputTokens": 0
+                                                },
+                                                "last": {
+                                                    "totalTokens": total,
+                                                    "inputTokens": input + cached,
+                                                    "cachedInputTokens": cached,
+                                                    "outputTokens": output,
+                                                    "reasoningOutputTokens": 0
+                                                },
+                                                "modelContextWindow": 1000000
+                                            }
+                                        }),
+                                    };
+                                    let json = serde_json::to_string(&notif).unwrap_or_default();
+                                    let _ = tui_sink.send(Message::text(json)).await;
+                                }
                             }
 
                             "skills/list" | "hooks/list" | "plugin/list" => {
@@ -479,6 +514,42 @@ pub async fn run(
                     }
                     Some(WicketEvent::Entry(entry)) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "entry", "data": &entry}));
+                    }
+                    Some(WicketEvent::Usage(usage)) => {
+                        exchange.log("wicket>puzzle", &serde_json::json!({"type": "usage", "data": &usage}));
+
+                        let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let cached = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let total = input + cached + output;
+
+                        let notif = JsonRpcNotification {
+                            jsonrpc: "2.0".into(),
+                            method: "thread/tokenUsage/updated".into(),
+                            params: serde_json::json!({
+                                "threadId": thread_id,
+                                "turnId": active_turn_id.as_deref().unwrap_or(""),
+                                "tokenUsage": {
+                                    "total": {
+                                        "totalTokens": total,
+                                        "inputTokens": input + cached,
+                                        "cachedInputTokens": cached,
+                                        "outputTokens": output,
+                                        "reasoningOutputTokens": 0
+                                    },
+                                    "last": {
+                                        "totalTokens": total,
+                                        "inputTokens": input + cached,
+                                        "cachedInputTokens": cached,
+                                        "outputTokens": output,
+                                        "reasoningOutputTokens": 0
+                                    },
+                                    "modelContextWindow": 1000000
+                                }
+                            }),
+                        };
+                        let json = serde_json::to_string(&notif).unwrap_or_default();
+                        let _ = tui_sink.send(Message::text(json)).await;
                     }
                     Some(WicketEvent::Lifecycle(name)) => {
                         tracing::info!(lifecycle = %name, "wicket lifecycle");

@@ -99,6 +99,7 @@ async fn main() -> Result<()> {
     // Collect all history entries from Wicket. They arrive in a burst
     // on connect. Wait for 200ms of silence to know the burst is done.
     let mut history: Vec<serde_json::Value> = vec![];
+    let mut initial_usage: Option<serde_json::Value> = None;
     loop {
         match tokio::time::timeout(
             std::time::Duration::from_millis(200),
@@ -107,7 +108,10 @@ async fn main() -> Result<()> {
             Ok(Some(wicket::WicketEvent::Entry(entry))) => {
                 history.push(entry);
             }
-            Ok(Some(_)) => {} // non-entry events during history load
+            Ok(Some(wicket::WicketEvent::Usage(usage))) => {
+                initial_usage = Some(usage);
+            }
+            Ok(Some(_)) => {}
             Ok(None) => break,
             Err(_) => break, // timeout — history burst is done
         }
@@ -143,7 +147,7 @@ async fn main() -> Result<()> {
     };
 
     // Run the translation loop with pre-loaded history.
-    translate::run(ws_stream, wicket, exchange, &slug, history).await?;
+    translate::run(ws_stream, wicket, exchange, &slug, history, initial_usage).await?;
 
     // Wait for the TUI to exit.
     let status = tui_child.wait().await?;

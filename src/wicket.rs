@@ -17,6 +17,7 @@ struct InboundEnvelope {
 pub enum WicketEvent {
     Delta(Value),
     Entry(Value),
+    Usage(Value),
     Lifecycle(String),
     Approval(Value),
     Meta(Value),
@@ -77,6 +78,7 @@ impl WicketClient {
                         let event = match envelope.stream.as_str() {
                             "delta" => WicketEvent::Delta(envelope.data),
                             "entry" => WicketEvent::Entry(envelope.data),
+                            "usage" => WicketEvent::Usage(envelope.data),
                             "lifecycle" => {
                                 let name = envelope.data
                                     .as_str()
