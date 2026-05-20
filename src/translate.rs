@@ -1,5 +1,6 @@
 // Translation loop between the Codex TUI (JSON-RPC/WebSocket) and Wicket (envelope/WebSocket).
 
+use codex_app_server_protocol::ServerNotification;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -84,12 +85,15 @@ fn wicket_entry_to_thread_items(entry: &Value) -> Vec<Value> {
             }
             ("assistant", "tool_use") => {
                 let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let summary = block.get("input_summary").and_then(|v| v.as_str()).unwrap_or("");
+                let command = block.get("input")
+                    .and_then(|input| input.get("command"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(name);
                 let home = std::env::var("HOME").unwrap_or_default();
                 items.push(serde_json::json!({
                     "type": "commandExecution",
                     "id": uuid,
-                    "command": format!("{} {}", name, summary),
+                    "command": command,
                     "cwd": format!("{}/pane/solver", home),
                     "source": "agent",
                     "status": "completed",
@@ -100,7 +104,22 @@ fn wicket_entry_to_thread_items(entry: &Value) -> Vec<Value> {
                 }));
             }
             ("user", "tool_result") => {
-                // Tool results are part of the command execution, skip for now.
+                // Tool results are part of the command execution lifecycle.
+                let content = block.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                if !content.is_empty() && content != "(structured content)" {
+                    items.push(serde_json::json!({
+                        "type": "commandExecution",
+                        "id": uuid,
+                        "command": "",
+                        "cwd": format!("{}/pane/solver", std::env::var("HOME").unwrap_or_default()),
+                        "source": "agent",
+                        "status": "completed",
+                        "commandActions": [],
+                        "aggregatedOutput": content,
+                        "exitCode": 0,
+                        "durationMs": null
+                    }));
+                }
             }
             _ => {}
         }
@@ -178,6 +197,21 @@ async fn send_error(
     Ok(())
 }
 
+async fn send_notification(
+    sink: &mut futures_util::stream::SplitSink<WebSocketStream<UnixStream>, Message>,
+    exchange: &ExchangeLog,
+    notif: ServerNotification,
+) -> color_eyre::eyre::Result<()> {
+    let mut obj = serde_json::to_value(&notif)?;
+    if let Some(map) = obj.as_object_mut() {
+        map.insert("jsonrpc".into(), serde_json::json!("2.0"));
+    }
+    let json = serde_json::to_string(&obj)?;
+    exchange.log("puzzle>tui", &obj);
+    sink.send(Message::text(json)).await?;
+    Ok(())
+}
+
 pub async fn run(
     tui_ws: WebSocketStream<UnixStream>,
     mut wicket: WicketClient,
@@ -193,6 +227,10 @@ pub async fn run(
     let cwd = format!("{}/pane/{}", home, slug);
     let mut active_turn_id: Option<String> = None;
     let mut active_item_id: Option<String> = None;
+    let mut active_tool_item_id: Option<String> = None;
+    let mut in_tool_use: bool = false;
+    let mut tool_input_json: String = String::new();
+    let mut last_stop_reason: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -374,7 +412,16 @@ pub async fn run(
                                     method: "turn/started".into(),
                                     params: serde_json::json!({
                                         "threadId": thread_id,
-                                        "turnId": turn_id
+                                        "turn": {
+                                            "id": turn_id,
+                                            "items": [],
+                                            "itemsView": "full",
+                                            "status": "inProgress",
+                                            "error": null,
+                                            "startedAt": chrono::Utc::now().timestamp(),
+                                            "completedAt": null,
+                                            "durationMs": null
+                                        }
                                     }),
                                 };
                                 let notif_json = serde_json::to_string(&notif)?;
@@ -429,84 +476,236 @@ pub async fn run(
                     Some(WicketEvent::Delta(delta)) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "delta", "data": &delta}));
 
-                        // Translate streaming deltas to Codex notifications.
-                        if let (Some(turn_id), Some(item_id)) = (&active_turn_id, &active_item_id) {
+                        if let Some(turn_id) = &active_turn_id {
+                            let turn_id = turn_id.clone();
                             let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
                             match delta_type {
                                 "content_block_start" => {
-                                    let notif = JsonRpcNotification {
-                                        jsonrpc: "2.0".into(),
-                                        method: "item/started".into(),
-                                        params: serde_json::json!({
-                                            "threadId": thread_id,
-                                            "turnId": turn_id,
-                                            "startedAtMs": chrono::Utc::now().timestamp_millis(),
-                                            "item": {
-                                                "type": "agentMessage",
-                                                "id": item_id,
-                                                "text": ""
-                                            }
-                                        }),
-                                    };
-                                    let json = serde_json::to_string(&notif)?;
-                                    exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
-                                    tui_sink.send(Message::text(json)).await?;
+                                    let block = delta.get("content_block").unwrap_or(&Value::Null);
+                                    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                                    if block_type == "tool_use" {
+                                        let tool_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                        let is_wicket_tool = tool_name.contains("wicket");
+
+                                        in_tool_use = true;
+                                        tool_input_json.clear();
+
+                                        if is_wicket_tool {
+                                            let tool_item_id = uuid::Uuid::new_v4().to_string();
+                                            active_tool_item_id = Some(tool_item_id.clone());
+                                        }
+                                    } else if block_type == "text" {
+                                        if let Some(tool_item_id) = active_tool_item_id.take() {
+                                            let completed_notif = JsonRpcNotification {
+                                                jsonrpc: "2.0".into(),
+                                                method: "item/completed".into(),
+                                                params: serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                    "item": {
+                                                        "type": "commandExecution",
+                                                        "id": tool_item_id,
+                                                        "command": "",
+                                                        "cwd": cwd,
+                                                        "source": "agent",
+                                                        "status": "completed",
+                                                        "commandActions": [],
+                                                        "aggregatedOutput": null,
+                                                        "exitCode": 0,
+                                                        "durationMs": null
+                                                    }
+                                                }),
+                                            };
+                                            let json = serde_json::to_string(&completed_notif)?;
+                                            tui_sink.send(Message::text(json)).await?;
+                                        }
+                                        if let Some(item_id) = &active_item_id {
+                                            let notif = JsonRpcNotification {
+                                                jsonrpc: "2.0".into(),
+                                                method: "item/started".into(),
+                                                params: serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "startedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                    "item": {
+                                                        "type": "agentMessage",
+                                                        "id": item_id,
+                                                        "text": ""
+                                                    }
+                                                }),
+                                            };
+                                            let json = serde_json::to_string(&notif)?;
+                                            exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
+                                            tui_sink.send(Message::text(json)).await?;
+                                        }
+                                    }
                                 }
                                 "content_block_delta" => {
                                     let inner = delta.get("delta").unwrap_or(&Value::Null);
-                                    let text = inner.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                                    if !text.is_empty() {
-                                        let notif = JsonRpcNotification {
-                                            jsonrpc: "2.0".into(),
-                                            method: "item/agentMessage/delta".into(),
-                                            params: serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "itemId": item_id,
-                                                "delta": text
-                                            }),
-                                        };
-                                        let json = serde_json::to_string(&notif)?;
-                                        tui_sink.send(Message::text(json)).await?;
+                                    let inner_type = inner.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                                    if in_tool_use && inner_type == "input_json_delta" {
+                                        if let Some(partial) = inner.get("partial_json").and_then(|v| v.as_str()) {
+                                            tool_input_json.push_str(partial);
+                                        }
+                                    } else if !in_tool_use {
+                                        let text = inner.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                                        if !text.is_empty() {
+                                            if let Some(item_id) = &active_item_id {
+                                                let notif = JsonRpcNotification {
+                                                    jsonrpc: "2.0".into(),
+                                                    method: "item/agentMessage/delta".into(),
+                                                    params: serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "itemId": item_id,
+                                                        "delta": text
+                                                    }),
+                                                };
+                                                let json = serde_json::to_string(&notif)?;
+                                                tui_sink.send(Message::text(json)).await?;
+                                            }
+                                        }
+                                    }
+                                }
+                                "content_block_stop" => {
+                                    if in_tool_use {
+                                        if let Some(ref tool_item_id) = active_tool_item_id {
+                                            let command = serde_json::from_str::<Value>(&tool_input_json)
+                                                .ok()
+                                                .and_then(|input| input.get("command").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                                                .unwrap_or_else(|| tool_input_json.clone());
+
+                                            let started_notif = JsonRpcNotification {
+                                                jsonrpc: "2.0".into(),
+                                                method: "item/started".into(),
+                                                params: serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "startedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                    "item": {
+                                                        "type": "commandExecution",
+                                                        "id": tool_item_id,
+                                                        "command": command,
+                                                        "cwd": cwd,
+                                                        "source": "agent",
+                                                        "status": "inProgress",
+                                                        "commandActions": [],
+                                                        "aggregatedOutput": null,
+                                                        "exitCode": null,
+                                                        "durationMs": null
+                                                    }
+                                                }),
+                                            };
+                                            let json = serde_json::to_string(&started_notif)?;
+                                            exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
+                                            tui_sink.send(Message::text(json)).await?;
+                                        }
+                                        in_tool_use = false;
+                                    }
+                                }
+                                "message_delta" => {
+                                    let inner = delta.get("delta").unwrap_or(&Value::Null);
+                                    if let Some(reason) = inner.get("stop_reason").and_then(|v| v.as_str()) {
+                                        last_stop_reason = Some(reason.to_string());
                                     }
                                 }
                                 "message_stop" => {
-                                    // Stream is done. Send item/completed then turn/completed.
-                                    let turn_id = active_turn_id.take().unwrap_or_default();
-                                    let item_id = active_item_id.take().unwrap_or_default();
+                                    let stop_reason = last_stop_reason.take().unwrap_or_default();
 
-                                    // item/completed
-                                    let item_notif = JsonRpcNotification {
-                                        jsonrpc: "2.0".into(),
-                                        method: "item/completed".into(),
-                                        params: serde_json::json!({
-                                            "threadId": thread_id,
-                                            "turnId": turn_id,
-                                            "completedAtMs": chrono::Utc::now().timestamp_millis(),
-                                            "item": {
-                                                "type": "agentMessage",
-                                                "id": item_id,
-                                                "text": ""
-                                            }
-                                        }),
-                                    };
-                                    let json = serde_json::to_string(&item_notif)?;
-                                    exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
-                                    tui_sink.send(Message::text(json)).await?;
+                                    if stop_reason == "tool_use" {
+                                        // Tool call in flight — don't end the turn.
+                                        // Complete the agentMessage item if one was active.
+                                        if let Some(item_id) = &active_item_id {
+                                            let notif = JsonRpcNotification {
+                                                jsonrpc: "2.0".into(),
+                                                method: "item/completed".into(),
+                                                params: serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                    "item": {
+                                                        "type": "agentMessage",
+                                                        "id": item_id,
+                                                        "text": ""
+                                                    }
+                                                }),
+                                            };
+                                            let json = serde_json::to_string(&notif)?;
+                                            tui_sink.send(Message::text(json)).await?;
+                                        }
+                                        active_item_id = Some(uuid::Uuid::new_v4().to_string());
+                                    } else {
+                                        if let Some(tool_item_id) = active_tool_item_id.take() {
+                                            let completed_notif = JsonRpcNotification {
+                                                jsonrpc: "2.0".into(),
+                                                method: "item/completed".into(),
+                                                params: serde_json::json!({
+                                                    "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                    "item": {
+                                                        "type": "commandExecution",
+                                                        "id": tool_item_id,
+                                                        "command": "",
+                                                        "cwd": cwd,
+                                                        "source": "agent",
+                                                        "status": "completed",
+                                                        "commandActions": [],
+                                                        "aggregatedOutput": null,
+                                                        "exitCode": 0,
+                                                        "durationMs": null
+                                                    }
+                                                }),
+                                            };
+                                            let json = serde_json::to_string(&completed_notif)?;
+                                            tui_sink.send(Message::text(json)).await?;
+                                        }
+                                        let turn_id_done = active_turn_id.take().unwrap_or_default();
+                                        let item_id_done = active_item_id.take().unwrap_or_default();
 
-                                    // turn/completed
-                                    let notif = JsonRpcNotification {
-                                        jsonrpc: "2.0".into(),
-                                        method: "turn/completed".into(),
-                                        params: serde_json::json!({
-                                            "threadId": thread_id,
-                                            "turnId": turn_id,
-                                            "status": "completed"
-                                        }),
-                                    };
-                                    let json = serde_json::to_string(&notif)?;
-                                    exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
-                                    tui_sink.send(Message::text(json)).await?;
+                                        let item_notif = JsonRpcNotification {
+                                            jsonrpc: "2.0".into(),
+                                            method: "item/completed".into(),
+                                            params: serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id_done,
+                                                "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                "item": {
+                                                    "type": "agentMessage",
+                                                    "id": item_id_done,
+                                                    "text": ""
+                                                }
+                                            }),
+                                        };
+                                        let json = serde_json::to_string(&item_notif)?;
+                                        exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
+                                        tui_sink.send(Message::text(json)).await?;
+
+                                        let now = chrono::Utc::now().timestamp();
+                                        let notif = JsonRpcNotification {
+                                            jsonrpc: "2.0".into(),
+                                            method: "turn/completed".into(),
+                                            params: serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turn": {
+                                                    "id": turn_id_done,
+                                                    "items": [],
+                                                    "itemsView": "full",
+                                                    "status": "completed",
+                                                    "error": null,
+                                                    "startedAt": now,
+                                                    "completedAt": now,
+                                                    "durationMs": null
+                                                }
+                                            }),
+                                        };
+                                        let json = serde_json::to_string(&notif)?;
+                                        exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
+                                        tui_sink.send(Message::text(json)).await?;
+                                    }
                                 }
                                 _ => {}
                             }
@@ -514,6 +713,57 @@ pub async fn run(
                     }
                     Some(WicketEvent::Entry(entry)) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "entry", "data": &entry}));
+                    }
+                    Some(WicketEvent::ToolStart(data)) => {
+                        exchange.log("wicket>puzzle", &serde_json::json!({"type": "tool_start", "data": &data}));
+                    }
+                    Some(WicketEvent::ToolDone(data)) => {
+                        exchange.log("wicket>puzzle", &serde_json::json!({"type": "tool_done", "data": &data}));
+
+                        if let Some(tool_item_id) = active_tool_item_id.take() {
+                            let turn_id = active_turn_id.as_deref().unwrap_or("");
+                            let output = data.get("output").and_then(|v| v.as_str()).unwrap_or("");
+                            let exit_code = data.get("exit_code").and_then(|v| v.as_i64());
+
+                            let output_notif = JsonRpcNotification {
+                                jsonrpc: "2.0".into(),
+                                method: "item/commandExecution/delta".into(),
+                                params: serde_json::json!({
+                                    "threadId": thread_id,
+                                    "turnId": turn_id,
+                                    "itemId": tool_item_id,
+                                    "delta": output
+                                }),
+                            };
+                            let json = serde_json::to_string(&output_notif)?;
+                            tui_sink.send(Message::text(json)).await?;
+
+                            let status = if exit_code == Some(0) { "completed" } else { "failed" };
+                            let completed_notif = JsonRpcNotification {
+                                jsonrpc: "2.0".into(),
+                                method: "item/completed".into(),
+                                params: serde_json::json!({
+                                    "threadId": thread_id,
+                                    "turnId": turn_id,
+                                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                    "item": {
+                                        "type": "commandExecution",
+                                        "id": tool_item_id,
+                                        "command": "",
+                                        "cwd": cwd,
+                                        "source": "agent",
+                                        "status": status,
+                                        "commandActions": [],
+                                        "aggregatedOutput": output,
+                                        "exitCode": exit_code,
+                                        "durationMs": null
+                                    }
+                                }),
+                            };
+                            let json = serde_json::to_string(&completed_notif)?;
+                            exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
+                            tui_sink.send(Message::text(json)).await?;
+                        }
                     }
                     Some(WicketEvent::Usage(usage)) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "usage", "data": &usage}));

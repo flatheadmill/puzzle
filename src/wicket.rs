@@ -18,6 +18,8 @@ pub enum WicketEvent {
     Delta(Value),
     Entry(Value),
     Usage(Value),
+    ToolStart(Value),
+    ToolDone(Value),
     Lifecycle(String),
     Approval(Value),
     Meta(Value),
@@ -79,6 +81,8 @@ impl WicketClient {
                             "delta" => WicketEvent::Delta(envelope.data),
                             "entry" => WicketEvent::Entry(envelope.data),
                             "usage" => WicketEvent::Usage(envelope.data),
+                            "tool_start" => WicketEvent::ToolStart(envelope.data),
+                            "tool_done" => WicketEvent::ToolDone(envelope.data),
                             "lifecycle" => {
                                 let name = envelope.data
                                     .as_str()
