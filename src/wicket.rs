@@ -32,7 +32,7 @@ pub struct WicketClient {
 }
 
 impl WicketClient {
-    pub async fn connect(url: &str, slug: &str) -> Result<Self, std::io::Error> {
+    pub async fn connect(url: &str, slug: &str, timestamp: Option<&str>) -> Result<Self, std::io::Error> {
         let (ws_stream, _) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))?;
@@ -40,12 +40,16 @@ impl WicketClient {
         let (mut sink, stream) = ws_stream.split();
 
         // Send the connect payload.
-        let payload = serde_json::json!({ "slug": slug });
+        let payload = serde_json::json!({
+            "slug": slug,
+            "protocol": "wicket",
+            "timestamp": timestamp
+        });
         sink.send(Message::text(payload.to_string()))
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
 
-        tracing::info!(slug, "wicket connected");
+        tracing::info!(slug, timestamp = ?timestamp, "wicket connected");
 
         // Outbound channel.
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<String>();

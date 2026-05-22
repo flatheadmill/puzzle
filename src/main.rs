@@ -91,9 +91,35 @@ async fn main() -> Result<()> {
     let listener = UnixListener::bind(&socket_path)?;
     tracing::info!(path = %socket_path.display(), "listening for codex TUI");
 
+    // Determine session timestamp: resume latest or create new with --new.
+    let new_session = args.iter().any(|a| a == "--new");
+    let timestamp = if new_session {
+        chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string()
+    } else {
+        let state_dir = PathBuf::from(&home)
+            .join(".local/state/puzzle")
+            .join(&slug);
+        let _ = std::fs::create_dir_all(&state_dir);
+        let mut latest: Option<String> = None;
+        if let Ok(entries) = std::fs::read_dir(&state_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.ends_with(".jsonl") && name.starts_with("20") {
+                        let ts = name.trim_end_matches(".jsonl").to_string();
+                        if latest.as_ref().map_or(true, |l| ts > *l) {
+                            latest = Some(ts);
+                        }
+                    }
+                }
+            }
+        }
+        latest.unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string())
+    };
+    tracing::info!(timestamp = %timestamp, new = new_session, "session timestamp");
+
     // Connect to Wicket and drain history before launching the TUI.
     let wicket_url = "ws://127.0.0.1:6502";
-    let mut wicket = wicket::WicketClient::connect(wicket_url, &slug).await?;
+    let mut wicket = wicket::WicketClient::connect(wicket_url, &slug, Some(&timestamp)).await?;
     tracing::info!("connected to wicket");
 
     // Collect all history entries from Wicket. They arrive in a burst
@@ -124,6 +150,9 @@ async fn main() -> Result<()> {
 
     let mut tui_child = Command::new(&codex_bin)
         .env("CODEX_HOME", &codex_home)
+        .env("PUZZLE_SLUG", &slug)
+        .env("PUZZLE_TIMESTAMP", &timestamp)
+        .env("RUNNING_UNDER_PUZZLE", "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
