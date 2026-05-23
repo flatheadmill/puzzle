@@ -233,7 +233,10 @@ pub async fn run(
     let mut active_turn_id: Option<String> = None;
     let mut active_item_id: Option<String> = None;
     let mut active_tool_item_id: Option<String> = None;
+    let mut active_tool_name: Option<String> = None;
+    let mut active_reasoning_item_id: Option<String> = None;
     let mut in_tool_use: bool = false;
+    let mut in_thinking: bool = false;
     let mut tool_input_json: String = String::new();
     let mut last_stop_reason: Option<String> = None;
     let mut pending_shell: Option<PendingShell> = None;
@@ -371,6 +374,12 @@ pub async fn run(
                             }
 
                             "thread/unsubscribe" => {
+                                send_response(&mut tui_sink, &exchange, id, serde_json::json!({})).await?;
+                            }
+
+                            "turn/interrupt" => {
+                                tracing::info!("turn interrupt");
+                                wicket.send_envelope("interrupt", serde_json::json!({}))?;
                                 send_response(&mut tui_sink, &exchange, id, serde_json::json!({})).await?;
                             }
 
@@ -562,12 +571,34 @@ pub async fn run(
                                     let block = delta.get("content_block").unwrap_or(&Value::Null);
                                     let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                                    if block_type == "tool_use" {
+                                    if block_type == "thinking" {
+                                        in_thinking = true;
+                                        let reasoning_id = uuid::Uuid::new_v4().to_string();
+                                        active_reasoning_item_id = Some(reasoning_id.clone());
+                                        let notif = JsonRpcNotification {
+                                            jsonrpc: "2.0".into(),
+                                            method: "item/started".into(),
+                                            params: serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": turn_id,
+                                                "startedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                "item": {
+                                                    "type": "reasoning",
+                                                    "id": reasoning_id,
+                                                    "summary": [],
+                                                    "content": []
+                                                }
+                                            }),
+                                        };
+                                        let json = serde_json::to_string(&notif)?;
+                                        tui_sink.send(Message::text(json)).await?;
+                                    } else if block_type == "tool_use" {
                                         let tool_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                                         let is_wicket_tool = tool_name.contains("wicket");
 
                                         in_tool_use = true;
                                         tool_input_json.clear();
+                                        active_tool_name = Some(tool_name.to_string());
 
                                         if is_wicket_tool {
                                             let tool_item_id = uuid::Uuid::new_v4().to_string();
@@ -624,11 +655,30 @@ pub async fn run(
                                     let inner = delta.get("delta").unwrap_or(&Value::Null);
                                     let inner_type = inner.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-                                    if in_tool_use && inner_type == "input_json_delta" {
+                                    if in_thinking && inner_type == "thinking_delta" {
+                                        let text = inner.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
+                                        if !text.is_empty() {
+                                            if let Some(ref reasoning_id) = active_reasoning_item_id {
+                                                let notif = JsonRpcNotification {
+                                                    jsonrpc: "2.0".into(),
+                                                    method: "item/reasoning/summaryTextDelta".into(),
+                                                    params: serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "itemId": reasoning_id,
+                                                        "delta": text,
+                                                        "summaryIndex": 0
+                                                    }),
+                                                };
+                                                let json = serde_json::to_string(&notif)?;
+                                                tui_sink.send(Message::text(json)).await?;
+                                            }
+                                        }
+                                    } else if in_tool_use && inner_type == "input_json_delta" {
                                         if let Some(partial) = inner.get("partial_json").and_then(|v| v.as_str()) {
                                             tool_input_json.push_str(partial);
                                         }
-                                    } else if !in_tool_use {
+                                    } else if !in_tool_use && !in_thinking {
                                         let text = inner.get("text").and_then(|v| v.as_str()).unwrap_or("");
                                         if !text.is_empty() {
                                             if let Some(item_id) = &active_item_id {
@@ -649,18 +699,149 @@ pub async fn run(
                                     }
                                 }
                                 "content_block_stop" => {
-                                    if in_tool_use {
-                                        if let Some(ref tool_item_id) = active_tool_item_id {
-                                            let command = serde_json::from_str::<Value>(&tool_input_json)
-                                                .ok()
-                                                .and_then(|input| input.get("command").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                                                .unwrap_or_else(|| tool_input_json.clone());
-
-                                            let started_notif = JsonRpcNotification {
+                                    if in_thinking {
+                                        if let Some(reasoning_id) = active_reasoning_item_id.take() {
+                                            let notif = JsonRpcNotification {
                                                 jsonrpc: "2.0".into(),
-                                                method: "item/started".into(),
+                                                method: "item/completed".into(),
                                                 params: serde_json::json!({
                                                     "threadId": thread_id,
+                                                    "turnId": turn_id,
+                                                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                    "item": {
+                                                        "type": "reasoning",
+                                                        "id": reasoning_id,
+                                                        "summary": [],
+                                                        "content": []
+                                                    }
+                                                }),
+                                            };
+                                            let json = serde_json::to_string(&notif)?;
+                                            tui_sink.send(Message::text(json)).await?;
+                                        }
+                                        in_thinking = false;
+                                    } else if in_tool_use {
+                                        if let Some(ref tool_item_id) = active_tool_item_id {
+                                            let tool = active_tool_name.as_deref().unwrap_or("");
+                                            let is_patch = tool.contains("apply_patch");
+
+                                            if is_patch {
+                                                let patch = serde_json::from_str::<Value>(&tool_input_json)
+                                                    .ok()
+                                                    .and_then(|input| input.get("patch").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                                                    .unwrap_or_default();
+
+                                                let mut changes: Vec<Value> = vec![];
+                                                let mut current_path: Option<String> = None;
+                                                let mut current_kind: Option<Value> = None;
+                                                let mut current_diff = String::new();
+
+                                                for line in patch.lines() {
+                                                    if let Some(path) = line.strip_prefix("*** Add File: ") {
+                                                        if let (Some(p), Some(k)) = (current_path.take(), current_kind.take()) {
+                                                            changes.push(serde_json::json!({ "path": p, "kind": k, "diff": current_diff.trim_end() }));
+                                                            current_diff.clear();
+                                                        }
+                                                        current_path = Some(path.trim().to_string());
+                                                        current_kind = Some(serde_json::json!({ "type": "add" }));
+                                                    } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
+                                                        if let (Some(p), Some(k)) = (current_path.take(), current_kind.take()) {
+                                                            changes.push(serde_json::json!({ "path": p, "kind": k, "diff": current_diff.trim_end() }));
+                                                            current_diff.clear();
+                                                        }
+                                                        current_path = Some(path.trim().to_string());
+                                                        current_kind = Some(serde_json::json!({ "type": "delete" }));
+                                                    } else if let Some(path) = line.strip_prefix("*** Update File: ") {
+                                                        if let (Some(p), Some(k)) = (current_path.take(), current_kind.take()) {
+                                                            changes.push(serde_json::json!({ "path": p, "kind": k, "diff": current_diff.trim_end() }));
+                                                            current_diff.clear();
+                                                        }
+                                                        current_path = Some(path.trim().to_string());
+                                                        current_kind = Some(serde_json::json!({ "type": "update", "movePath": null }));
+                                                    } else if line == "*** Begin Patch" || line == "*** End Patch" {
+                                                        // skip markers
+                                                    } else if current_path.is_some() {
+                                                        current_diff.push_str(line);
+                                                        current_diff.push('\n');
+                                                    }
+                                                }
+                                                if let (Some(p), Some(k)) = (current_path.take(), current_kind.take()) {
+                                                    changes.push(serde_json::json!({ "path": p, "kind": k, "diff": current_diff.trim_end() }));
+                                                }
+
+                                                // Convert patch-format diffs to unified diff for diffy parsing.
+                                                for c in changes.iter_mut() {
+                                                    let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                    let raw_diff = c.get("diff").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                    let kind_type = c.get("kind").and_then(|v| v.get("type")).and_then(|v| v.as_str()).unwrap_or("");
+                                                    if !raw_diff.is_empty() && kind_type == "update" {
+                                                        let mut old_count = 0usize;
+                                                        let mut new_count = 0usize;
+                                                        let mut diff_lines = String::new();
+                                                        for dl in raw_diff.lines() {
+                                                            if dl.starts_with("@@") {
+                                                                continue;
+                                                            }
+                                                            if dl.starts_with('-') {
+                                                                old_count += 1;
+                                                            } else if dl.starts_with('+') {
+                                                                new_count += 1;
+                                                            } else if dl.starts_with(' ') || !dl.is_empty() {
+                                                                old_count += 1;
+                                                                new_count += 1;
+                                                            }
+                                                            diff_lines.push_str(dl);
+                                                            diff_lines.push('\n');
+                                                        }
+                                                        let unified = format!(
+                                                            "--- a/{}\n+++ b/{}\n@@ -1,{} +1,{} @@\n{}",
+                                                            path, path, old_count, new_count, diff_lines.trim_end()
+                                                        );
+                                                        c.as_object_mut().map(|m| m.insert("diff".into(), serde_json::json!(unified)));
+                                                    }
+                                                }
+
+                                                let started_notif = JsonRpcNotification {
+                                                    jsonrpc: "2.0".into(),
+                                                    method: "item/started".into(),
+                                                    params: serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "startedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                        "item": {
+                                                            "type": "fileChange",
+                                                            "id": tool_item_id,
+                                                            "changes": changes,
+                                                            "status": "inProgress"
+                                                        }
+                                                    }),
+                                                };
+                                                let json = serde_json::to_string(&started_notif)?;
+                                                tui_sink.send(Message::text(json)).await?;
+
+                                                let patch_notif = JsonRpcNotification {
+                                                    jsonrpc: "2.0".into(),
+                                                    method: "item/fileChange/patchUpdated".into(),
+                                                    params: serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "itemId": tool_item_id,
+                                                        "changes": changes
+                                                    }),
+                                                };
+                                                let json = serde_json::to_string(&patch_notif)?;
+                                                tui_sink.send(Message::text(json)).await?;
+                                            } else {
+                                                let command = serde_json::from_str::<Value>(&tool_input_json)
+                                                    .ok()
+                                                    .and_then(|input| input.get("command").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                                                    .unwrap_or_else(|| tool_input_json.clone());
+
+                                                let started_notif = JsonRpcNotification {
+                                                    jsonrpc: "2.0".into(),
+                                                    method: "item/started".into(),
+                                                    params: serde_json::json!({
+                                                        "threadId": thread_id,
                                                     "turnId": turn_id,
                                                     "startedAtMs": chrono::Utc::now().timestamp_millis(),
                                                     "item": {
@@ -680,8 +861,10 @@ pub async fn run(
                                             let json = serde_json::to_string(&started_notif)?;
                                             exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
                                             tui_sink.send(Message::text(json)).await?;
+                                            }
                                         }
                                         in_tool_use = false;
+                                        active_tool_name = None;
                                     }
                                 }
                                 "message_delta" => {
