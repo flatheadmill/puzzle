@@ -158,6 +158,9 @@ fn build_turns_from_entries(entries: &[Value]) -> Vec<Value> {
                     }
                     ("assistant", "tool_use") => {
                         let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        if !name.contains("wicket") {
+                            continue;
+                        }
 
                         // Look ahead for the tool_result in the next entry.
                         let mut tool_output = String::new();
