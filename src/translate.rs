@@ -46,6 +46,73 @@ struct JsonRpcErrorBody {
     message: String,
 }
 
+fn parse_patch_to_changes(patch: &str) -> Vec<Value> {
+    let mut changes: Vec<Value> = vec![];
+    let mut current_path: Option<String> = None;
+    let mut current_kind: Option<Value> = None;
+    let mut current_diff = String::new();
+
+    for line in patch.lines() {
+        if let Some(path) = line.strip_prefix("*** Add File: ") {
+            if let (Some(p), Some(k)) = (current_path.take(), current_kind.take()) {
+                changes.push(serde_json::json!({ "path": p, "kind": k, "diff": current_diff.trim_end() }));
+                current_diff.clear();
+            }
+            current_path = Some(path.trim().to_string());
+            current_kind = Some(serde_json::json!({ "type": "add" }));
+        } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            if let (Some(p), Some(k)) = (current_path.take(), current_kind.take()) {
+                changes.push(serde_json::json!({ "path": p, "kind": k, "diff": current_diff.trim_end() }));
+                current_diff.clear();
+            }
+            current_path = Some(path.trim().to_string());
+            current_kind = Some(serde_json::json!({ "type": "delete" }));
+        } else if let Some(path) = line.strip_prefix("*** Update File: ") {
+            if let (Some(p), Some(k)) = (current_path.take(), current_kind.take()) {
+                changes.push(serde_json::json!({ "path": p, "kind": k, "diff": current_diff.trim_end() }));
+                current_diff.clear();
+            }
+            current_path = Some(path.trim().to_string());
+            current_kind = Some(serde_json::json!({ "type": "update", "movePath": null }));
+        } else if line == "*** Begin Patch" || line == "*** End Patch" {
+            // skip markers
+        } else if current_path.is_some() {
+            current_diff.push_str(line);
+            current_diff.push('\n');
+        }
+    }
+    if let (Some(p), Some(k)) = (current_path.take(), current_kind.take()) {
+        changes.push(serde_json::json!({ "path": p, "kind": k, "diff": current_diff.trim_end() }));
+    }
+
+    // Convert to unified diff for update changes.
+    for c in changes.iter_mut() {
+        let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let raw_diff = c.get("diff").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let kind_type = c.get("kind").and_then(|v| v.get("type")).and_then(|v| v.as_str()).unwrap_or("");
+        if !raw_diff.is_empty() && kind_type == "update" {
+            let mut old_count = 0usize;
+            let mut new_count = 0usize;
+            let mut diff_lines = String::new();
+            for dl in raw_diff.lines() {
+                if dl.starts_with("@@") { continue; }
+                if dl.starts_with('-') { old_count += 1; }
+                else if dl.starts_with('+') { new_count += 1; }
+                else if dl.starts_with(' ') || !dl.is_empty() { old_count += 1; new_count += 1; }
+                diff_lines.push_str(dl);
+                diff_lines.push('\n');
+            }
+            let unified = format!(
+                "--- a/{}\n+++ b/{}\n@@ -1,{} +1,{} @@\n{}",
+                path, path, old_count, new_count, diff_lines.trim_end()
+            );
+            c.as_object_mut().map(|m| m.insert("diff".into(), serde_json::json!(unified)));
+        }
+    }
+
+    changes
+}
+
 fn wicket_entry_to_thread_items(entry: &Value) -> Vec<Value> {
     let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     let blocks = entry.get("blocks").and_then(|v| v.as_array());
@@ -85,23 +152,38 @@ fn wicket_entry_to_thread_items(entry: &Value) -> Vec<Value> {
             }
             ("assistant", "tool_use") => {
                 let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let command = block.get("input")
-                    .and_then(|input| input.get("command"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(name);
                 let home = std::env::var("HOME").unwrap_or_default();
-                items.push(serde_json::json!({
-                    "type": "commandExecution",
-                    "id": uuid,
-                    "command": command,
-                    "cwd": format!("{}/pane/solver", home),
-                    "source": "agent",
-                    "status": "completed",
-                    "commandActions": [],
-                    "aggregatedOutput": null,
-                    "exitCode": 0,
-                    "durationMs": null
-                }));
+
+                if name.contains("apply_patch") {
+                    let patch = block.get("input")
+                        .and_then(|input| input.get("patch"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let changes = parse_patch_to_changes(patch);
+                    items.push(serde_json::json!({
+                        "type": "fileChange",
+                        "id": uuid,
+                        "changes": changes,
+                        "status": "completed"
+                    }));
+                } else {
+                    let command = block.get("input")
+                        .and_then(|input| input.get("command"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(name);
+                    items.push(serde_json::json!({
+                        "type": "commandExecution",
+                        "id": uuid,
+                        "command": command,
+                        "cwd": format!("{}/pane/solver", home),
+                        "source": "agent",
+                        "status": "completed",
+                        "commandActions": [],
+                        "aggregatedOutput": null,
+                        "exitCode": 0,
+                        "durationMs": null
+                    }));
+                }
             }
             ("user", "tool_result") => {
                 // Tool results are part of the command execution lifecycle.
@@ -731,75 +813,7 @@ pub async fn run(
                                                     .and_then(|input| input.get("patch").and_then(|v| v.as_str()).map(|s| s.to_string()))
                                                     .unwrap_or_default();
 
-                                                let mut changes: Vec<Value> = vec![];
-                                                let mut current_path: Option<String> = None;
-                                                let mut current_kind: Option<Value> = None;
-                                                let mut current_diff = String::new();
-
-                                                for line in patch.lines() {
-                                                    if let Some(path) = line.strip_prefix("*** Add File: ") {
-                                                        if let (Some(p), Some(k)) = (current_path.take(), current_kind.take()) {
-                                                            changes.push(serde_json::json!({ "path": p, "kind": k, "diff": current_diff.trim_end() }));
-                                                            current_diff.clear();
-                                                        }
-                                                        current_path = Some(path.trim().to_string());
-                                                        current_kind = Some(serde_json::json!({ "type": "add" }));
-                                                    } else if let Some(path) = line.strip_prefix("*** Delete File: ") {
-                                                        if let (Some(p), Some(k)) = (current_path.take(), current_kind.take()) {
-                                                            changes.push(serde_json::json!({ "path": p, "kind": k, "diff": current_diff.trim_end() }));
-                                                            current_diff.clear();
-                                                        }
-                                                        current_path = Some(path.trim().to_string());
-                                                        current_kind = Some(serde_json::json!({ "type": "delete" }));
-                                                    } else if let Some(path) = line.strip_prefix("*** Update File: ") {
-                                                        if let (Some(p), Some(k)) = (current_path.take(), current_kind.take()) {
-                                                            changes.push(serde_json::json!({ "path": p, "kind": k, "diff": current_diff.trim_end() }));
-                                                            current_diff.clear();
-                                                        }
-                                                        current_path = Some(path.trim().to_string());
-                                                        current_kind = Some(serde_json::json!({ "type": "update", "movePath": null }));
-                                                    } else if line == "*** Begin Patch" || line == "*** End Patch" {
-                                                        // skip markers
-                                                    } else if current_path.is_some() {
-                                                        current_diff.push_str(line);
-                                                        current_diff.push('\n');
-                                                    }
-                                                }
-                                                if let (Some(p), Some(k)) = (current_path.take(), current_kind.take()) {
-                                                    changes.push(serde_json::json!({ "path": p, "kind": k, "diff": current_diff.trim_end() }));
-                                                }
-
-                                                // Convert patch-format diffs to unified diff for diffy parsing.
-                                                for c in changes.iter_mut() {
-                                                    let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                                    let raw_diff = c.get("diff").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                                    let kind_type = c.get("kind").and_then(|v| v.get("type")).and_then(|v| v.as_str()).unwrap_or("");
-                                                    if !raw_diff.is_empty() && kind_type == "update" {
-                                                        let mut old_count = 0usize;
-                                                        let mut new_count = 0usize;
-                                                        let mut diff_lines = String::new();
-                                                        for dl in raw_diff.lines() {
-                                                            if dl.starts_with("@@") {
-                                                                continue;
-                                                            }
-                                                            if dl.starts_with('-') {
-                                                                old_count += 1;
-                                                            } else if dl.starts_with('+') {
-                                                                new_count += 1;
-                                                            } else if dl.starts_with(' ') || !dl.is_empty() {
-                                                                old_count += 1;
-                                                                new_count += 1;
-                                                            }
-                                                            diff_lines.push_str(dl);
-                                                            diff_lines.push('\n');
-                                                        }
-                                                        let unified = format!(
-                                                            "--- a/{}\n+++ b/{}\n@@ -1,{} +1,{} @@\n{}",
-                                                            path, path, old_count, new_count, diff_lines.trim_end()
-                                                        );
-                                                        c.as_object_mut().map(|m| m.insert("diff".into(), serde_json::json!(unified)));
-                                                    }
-                                                }
+                                                let changes = parse_patch_to_changes(&patch);
 
                                                 let started_notif = JsonRpcNotification {
                                                     jsonrpc: "2.0".into(),
