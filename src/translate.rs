@@ -113,123 +113,111 @@ fn parse_patch_to_changes(patch: &str) -> Vec<Value> {
     changes
 }
 
-fn wicket_entry_to_thread_items(entry: &Value) -> Vec<Value> {
-    let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-    let blocks = entry.get("blocks").and_then(|v| v.as_array());
-    let uuid = entry.get("uuid").and_then(|v| v.as_str())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().leak());
-
-    let Some(blocks) = blocks else { return vec![] };
-    let mut items = vec![];
-
-    for block in blocks {
-        let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        match (kind, btype) {
-            ("user", "text") => {
-                let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                items.push(serde_json::json!({
-                    "type": "userMessage",
-                    "id": uuid,
-                    "content": [{ "type": "text", "text": text }]
-                }));
-            }
-            ("assistant", "text") => {
-                let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                items.push(serde_json::json!({
-                    "type": "agentMessage",
-                    "id": uuid,
-                    "text": text
-                }));
-            }
-            ("assistant", "thinking") => {
-                let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                items.push(serde_json::json!({
-                    "type": "reasoning",
-                    "id": uuid,
-                    "summary": [text],
-                    "content": []
-                }));
-            }
-            ("assistant", "tool_use") => {
-                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let home = std::env::var("HOME").unwrap_or_default();
-
-                if name.contains("apply_patch") {
-                    let patch = block.get("input")
-                        .and_then(|input| input.get("patch"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let changes = parse_patch_to_changes(patch);
-                    items.push(serde_json::json!({
-                        "type": "fileChange",
-                        "id": uuid,
-                        "changes": changes,
-                        "status": "completed"
-                    }));
-                } else {
-                    let command = block.get("input")
-                        .and_then(|input| input.get("command"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(name);
-                    items.push(serde_json::json!({
-                        "type": "commandExecution",
-                        "id": uuid,
-                        "command": command,
-                        "cwd": format!("{}/pane/solver", home),
-                        "source": "agent",
-                        "status": "completed",
-                        "commandActions": [],
-                        "aggregatedOutput": null,
-                        "exitCode": 0,
-                        "durationMs": null
-                    }));
-                }
-            }
-            ("user", "tool_result") => {
-                // Tool results are part of the command execution lifecycle.
-                let content = block.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                if !content.is_empty() && content != "(structured content)" {
-                    items.push(serde_json::json!({
-                        "type": "commandExecution",
-                        "id": uuid,
-                        "command": "",
-                        "cwd": format!("{}/pane/solver", std::env::var("HOME").unwrap_or_default()),
-                        "source": "agent",
-                        "status": "completed",
-                        "commandActions": [],
-                        "aggregatedOutput": content,
-                        "exitCode": 0,
-                        "durationMs": null
-                    }));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    items
-}
 
 fn build_turns_from_entries(entries: &[Value]) -> Vec<Value> {
     let mut turns: Vec<Value> = vec![];
     let mut current_items: Vec<Value> = vec![];
-    let mut last_kind = "";
+    let home = std::env::var("HOME").unwrap_or_default();
 
-    for entry in entries {
+    let mut i = 0;
+    while i < entries.len() {
+        let entry = &entries[i];
         let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let blocks = entry.get("blocks").and_then(|v| v.as_array());
+        let uuid = entry.get("uuid").and_then(|v| v.as_str())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().leak());
 
-        // Start a new turn when we see a user message after assistant content.
-        if kind == "user" && last_kind == "assistant" && !current_items.is_empty() {
-            // Close the previous turn (assistant turn).
-            // But actually, we should group user + assistant into one turn.
+        if let Some(blocks) = blocks {
+            for block in blocks {
+                let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match (kind, btype) {
+                    ("user", "text") => {
+                        let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        current_items.push(serde_json::json!({
+                            "type": "userMessage",
+                            "id": uuid,
+                            "content": [{ "type": "text", "text": text }]
+                        }));
+                    }
+                    ("assistant", "text") => {
+                        let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        current_items.push(serde_json::json!({
+                            "type": "agentMessage",
+                            "id": uuid,
+                            "text": text
+                        }));
+                    }
+                    ("assistant", "thinking") => {
+                        let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        current_items.push(serde_json::json!({
+                            "type": "reasoning",
+                            "id": uuid,
+                            "summary": [text],
+                            "content": []
+                        }));
+                    }
+                    ("assistant", "tool_use") => {
+                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+                        // Look ahead for the tool_result in the next entry.
+                        let mut tool_output = String::new();
+                        if i + 1 < entries.len() {
+                            let next = &entries[i + 1];
+                            if next.get("kind").and_then(|v| v.as_str()) == Some("user") {
+                                if let Some(next_blocks) = next.get("blocks").and_then(|v| v.as_array()) {
+                                    for nb in next_blocks {
+                                        if nb.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
+                                            tool_output = nb.get("content")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("")
+                                                .to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if name.contains("apply_patch") {
+                            let patch = block.get("input")
+                                .and_then(|input| input.get("patch"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let changes = parse_patch_to_changes(patch);
+                            current_items.push(serde_json::json!({
+                                "type": "fileChange",
+                                "id": uuid,
+                                "changes": changes,
+                                "status": "completed"
+                            }));
+                        } else {
+                            let command = block.get("input")
+                                .and_then(|input| input.get("command"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(name);
+                            current_items.push(serde_json::json!({
+                                "type": "commandExecution",
+                                "id": uuid,
+                                "command": command,
+                                "cwd": format!("{}/pane/solver", home),
+                                "source": "agent",
+                                "status": "completed",
+                                "commandActions": [],
+                                "aggregatedOutput": if tool_output.is_empty() { Value::Null } else { Value::String(tool_output.clone()) },
+                                "exitCode": 0,
+                                "durationMs": null
+                            }));
+                        }
+                    }
+                    ("user", "tool_result") => {
+                        // Handled by look-ahead from tool_use. Skip.
+                    }
+                    _ => {}
+                }
+            }
         }
-
-        let items = wicket_entry_to_thread_items(entry);
-        current_items.extend(items);
-        last_kind = kind;
+        i += 1;
     }
 
-    // Package all items as a single turn for now.
     if !current_items.is_empty() {
         turns.push(serde_json::json!({
             "id": uuid::Uuid::new_v4().to_string(),
