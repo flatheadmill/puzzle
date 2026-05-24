@@ -92,28 +92,26 @@ async fn main() -> Result<()> {
     tracing::info!(path = %socket_path.display(), "listening for codex TUI");
 
     // Determine session timestamp: resume latest or create new with --new.
+    // Puzzle records its last-used timestamp in its own state directory.
     let new_session = args.iter().any(|a| a == "--new");
+    let state_dir = PathBuf::from(&home)
+        .join(".local/state/puzzle")
+        .join(&slug);
+    let _ = std::fs::create_dir_all(&state_dir);
+    let timestamp_file = state_dir.join("timestamp");
     let timestamp = if new_session {
-        chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string()
+        let ts = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
+        let _ = std::fs::write(&timestamp_file, &ts);
+        ts
     } else {
-        let state_dir = PathBuf::from(&home)
-            .join(".local/state/puzzle")
-            .join(&slug);
-        let _ = std::fs::create_dir_all(&state_dir);
-        let mut latest: Option<String> = None;
-        if let Ok(entries) = std::fs::read_dir(&state_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(".jsonl") && name.starts_with("20") {
-                        let ts = name.trim_end_matches(".jsonl").to_string();
-                        if latest.as_ref().map_or(true, |l| ts > *l) {
-                            latest = Some(ts);
-                        }
-                    }
-                }
+        match std::fs::read_to_string(&timestamp_file) {
+            Ok(ts) if !ts.trim().is_empty() => ts.trim().to_string(),
+            _ => {
+                let ts = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
+                let _ = std::fs::write(&timestamp_file, &ts);
+                ts
             }
         }
-        latest.unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string())
     };
     tracing::info!(timestamp = %timestamp, new = new_session, "session timestamp");
 
