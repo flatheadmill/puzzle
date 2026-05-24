@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-codex-app-server-protocol = { git = "https://github.com/openai/codex", rev = "7880414a", package = "codex-app-server-protocol" }
+codex-app-server-protocol = { git = "https://github.com/openai/codex", rev = "7d47056e", package = "codex-app-server-protocol" }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
