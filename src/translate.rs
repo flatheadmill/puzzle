@@ -120,18 +120,65 @@ fn parse_patch_to_changes(patch: &str) -> Vec<Value> {
 }
 
 
+fn is_interrupt_marker(entry: &Value) -> bool {
+    let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if kind != "user" { return false; }
+    entry.get("blocks")
+        .and_then(|v| v.as_array())
+        .and_then(|blocks| blocks.first())
+        .and_then(|b| b.get("text"))
+        .and_then(|v| v.as_str())
+        .map(|t| t.starts_with("[Request interrupted by user"))
+        .unwrap_or(false)
+}
+
+fn is_user_text_entry(entry: &Value) -> bool {
+    let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if kind != "user" { return false; }
+    entry.get("blocks")
+        .and_then(|v| v.as_array())
+        .map(|blocks| blocks.iter().any(|b| b.get("type").and_then(|v| v.as_str()) == Some("text")))
+        .unwrap_or(false)
+}
+
+fn flush_turn(turns: &mut Vec<Value>, items: &mut Vec<Value>, status: &str) {
+    if items.is_empty() { return; }
+    turns.push(serde_json::json!({
+        "id": uuid::Uuid::new_v4().to_string(),
+        "items": items.drain(..).collect::<Vec<_>>(),
+        "itemsView": "full",
+        "status": status,
+        "error": null,
+        "startedAt": 0,
+        "completedAt": 0,
+        "durationMs": null
+    }));
+}
+
 fn build_turns_from_entries(entries: &[Value]) -> Vec<Value> {
     let mut turns: Vec<Value> = vec![];
     let mut current_items: Vec<Value> = vec![];
     let home = std::env::var("HOME").unwrap_or_default();
+    let cwd = format!("{}/pane/solver", home);
 
     let mut i = 0;
     while i < entries.len() {
         let entry = &entries[i];
+
+        if is_interrupt_marker(entry) {
+            flush_turn(&mut turns, &mut current_items, "interrupted");
+            i += 1;
+            continue;
+        }
+
         let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let blocks = entry.get("blocks").and_then(|v| v.as_array());
         let uuid = entry.get("uuid").and_then(|v| v.as_str())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().leak());
+
+        if is_user_text_entry(entry) && !current_items.is_empty() {
+            flush_turn(&mut turns, &mut current_items, "completed");
+        }
 
         if let Some(blocks) = blocks {
             for block in blocks {
@@ -168,7 +215,6 @@ fn build_turns_from_entries(entries: &[Value]) -> Vec<Value> {
                             continue;
                         }
 
-                        // Look ahead for the tool_result in the next entry.
                         let mut tool_output = String::new();
                         if i + 1 < entries.len() {
                             let next = &entries[i + 1];
@@ -207,7 +253,7 @@ fn build_turns_from_entries(entries: &[Value]) -> Vec<Value> {
                                 "type": "commandExecution",
                                 "id": uuid,
                                 "command": command,
-                                "cwd": format!("{}/pane/solver", home),
+                                "cwd": cwd,
                                 "source": "agent",
                                 "status": "completed",
                                 "commandActions": [],
@@ -217,9 +263,7 @@ fn build_turns_from_entries(entries: &[Value]) -> Vec<Value> {
                             }));
                         }
                     }
-                    ("user", "tool_result") => {
-                        // Handled by look-ahead from tool_use. Skip.
-                    }
+                    ("user", "tool_result") => {}
                     _ => {}
                 }
             }
@@ -227,17 +271,7 @@ fn build_turns_from_entries(entries: &[Value]) -> Vec<Value> {
         i += 1;
     }
 
-    if !current_items.is_empty() {
-        turns.push(serde_json::json!({
-            "id": uuid::Uuid::new_v4().to_string(),
-            "items": current_items,
-            "itemsView": "full",
-            "status": "completed",
-            "startedAt": 0,
-            "completedAt": 0
-        }));
-    }
-
+    flush_turn(&mut turns, &mut current_items, "completed");
     turns
 }
 
@@ -315,6 +349,7 @@ pub async fn run(
     let mut active_tool_name: Option<String> = None;
     let mut active_reasoning_item_id: Option<String> = None;
     let mut in_tool_use: bool = false;
+    let mut turn_interrupted: bool = false;
     let mut in_thinking: bool = false;
     let mut tool_input_json: String = String::new();
     let mut last_stop_reason: Option<String> = None;
@@ -458,6 +493,7 @@ pub async fn run(
 
                             "turn/interrupt" => {
                                 tracing::info!("turn interrupt");
+                                turn_interrupted = true;
                                 wicket.send_envelope("interrupt", serde_json::json!({}))?;
                                 send_response(&mut tui_sink, &exchange, id, serde_json::json!({})).await?;
                             }
@@ -957,6 +993,8 @@ pub async fn run(
                                         tui_sink.send(Message::text(json)).await?;
 
                                         let now = chrono::Utc::now().timestamp();
+                                        let turn_status = if turn_interrupted { "interrupted" } else { "completed" };
+                                        turn_interrupted = false;
                                         let notif = JsonRpcNotification {
                                             jsonrpc: "2.0".into(),
                                             method: "turn/completed".into(),
@@ -966,7 +1004,7 @@ pub async fn run(
                                                     "id": turn_id_done,
                                                     "items": [],
                                                     "itemsView": "full",
-                                                    "status": "completed",
+                                                    "status": turn_status,
                                                     "error": null,
                                                     "startedAt": now,
                                                     "completedAt": now,
@@ -1143,6 +1181,57 @@ pub async fn run(
                     }
                     Some(WicketEvent::Lifecycle(name)) => {
                         tracing::info!(lifecycle = %name, "wicket lifecycle");
+                        if name == "round_interrupted" {
+                            tracing::info!(active_turn = ?active_turn_id, "handling round_interrupted");
+                            if let Some(turn_id_done) = active_turn_id.take() {
+                                let item_id_done = active_item_id.take().unwrap_or_default();
+                                active_tool_item_id = None;
+                                active_tool_name = None;
+                                active_reasoning_item_id = None;
+                                in_tool_use = false;
+                                in_thinking = false;
+                                turn_interrupted = false;
+
+                                let item_notif = JsonRpcNotification {
+                                    jsonrpc: "2.0".into(),
+                                    method: "item/completed".into(),
+                                    params: serde_json::json!({
+                                        "threadId": thread_id,
+                                        "turnId": turn_id_done,
+                                        "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                        "item": {
+                                            "type": "agentMessage",
+                                            "id": item_id_done,
+                                            "text": ""
+                                        }
+                                    }),
+                                };
+                                let json = serde_json::to_string(&item_notif).unwrap_or_default();
+                                let _ = tui_sink.send(Message::text(json)).await;
+
+                                let now = chrono::Utc::now().timestamp();
+                                let notif = JsonRpcNotification {
+                                    jsonrpc: "2.0".into(),
+                                    method: "turn/completed".into(),
+                                    params: serde_json::json!({
+                                        "threadId": thread_id,
+                                        "turn": {
+                                            "id": turn_id_done,
+                                            "items": [],
+                                            "itemsView": "full",
+                                            "status": "interrupted",
+                                            "error": null,
+                                            "startedAt": now,
+                                            "completedAt": now,
+                                            "durationMs": null
+                                        }
+                                    }),
+                                };
+                                let json = serde_json::to_string(&notif).unwrap_or_default();
+                                exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json).unwrap_or_default());
+                                let _ = tui_sink.send(Message::text(json)).await;
+                            }
+                        }
                     }
                     Some(WicketEvent::Approval(data)) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "approval", "data": &data}));
