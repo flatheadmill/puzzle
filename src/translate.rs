@@ -839,8 +839,32 @@ pub async fn run(
                                         if let Some(ref tool_item_id) = active_tool_item_id {
                                             let tool = active_tool_name.as_deref().unwrap_or("");
                                             let is_patch = tool.contains("apply_patch");
+                                            let is_view_image = tool.contains("view_image");
 
-                                            if is_patch {
+                                            if is_view_image {
+                                                let image_path = serde_json::from_str::<Value>(&tool_input_json)
+                                                    .ok()
+                                                    .and_then(|input| input.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                                                    .unwrap_or_default();
+
+                                                let started_notif = JsonRpcNotification {
+                                                    jsonrpc: "2.0".into(),
+                                                    method: "item/started".into(),
+                                                    params: serde_json::json!({
+                                                        "threadId": thread_id,
+                                                        "turnId": turn_id,
+                                                        "startedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                        "item": {
+                                                            "type": "imageView",
+                                                            "id": tool_item_id,
+                                                            "path": image_path
+                                                        }
+                                                    }),
+                                                };
+                                                let json = serde_json::to_string(&started_notif)?;
+                                                exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
+                                                tui_sink.send(Message::text(json)).await?;
+                                            } else if is_patch {
                                                 let patch = serde_json::from_str::<Value>(&tool_input_json)
                                                     .ok()
                                                     .and_then(|input| input.get("patch").and_then(|v| v.as_str()).map(|s| s.to_string()))
