@@ -1,6 +1,12 @@
 // Translation loop between the Codex TUI (JSON-RPC/WebSocket) and Wicket (envelope/WebSocket).
 
-use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::{
+    ServerNotification,
+    ReasoningSummaryTextDeltaNotification,
+    ItemStartedNotification,
+    ItemCompletedNotification,
+    ThreadItem,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -149,12 +155,12 @@ fn build_turns_from_entries(entries: &[Value]) -> Vec<Value> {
                     }
                     ("assistant", "thinking") => {
                         let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        current_items.push(serde_json::json!({
-                            "type": "reasoning",
-                            "id": uuid,
-                            "summary": [text],
-                            "content": []
-                        }));
+                        let item = ThreadItem::Reasoning {
+                            id: uuid.to_string(),
+                            summary: vec![format!("**Thinking**\n\n{}", text)],
+                            content: vec![],
+                        };
+                        current_items.push(serde_json::to_value(&item).unwrap_or_default());
                     }
                     ("assistant", "tool_use") => {
                         let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
@@ -645,26 +651,33 @@ pub async fn run(
                                     let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
                                     if block_type == "thinking" {
+                                        tracing::info!("THINKING block detected");
                                         in_thinking = true;
                                         let reasoning_id = uuid::Uuid::new_v4().to_string();
                                         active_reasoning_item_id = Some(reasoning_id.clone());
-                                        let notif = JsonRpcNotification {
-                                            jsonrpc: "2.0".into(),
-                                            method: "item/started".into(),
-                                            params: serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": turn_id,
-                                                "startedAtMs": chrono::Utc::now().timestamp_millis(),
-                                                "item": {
-                                                    "type": "reasoning",
-                                                    "id": reasoning_id,
-                                                    "summary": [],
-                                                    "content": []
+                                        send_notification(&mut tui_sink, &exchange,
+                                            ServerNotification::ItemStarted(ItemStartedNotification {
+                                                thread_id: thread_id.clone(),
+                                                turn_id: turn_id.clone(),
+                                                started_at_ms: chrono::Utc::now().timestamp_millis(),
+                                                item: ThreadItem::Reasoning {
+                                                    id: reasoning_id.clone(),
+                                                    summary: vec![],
+                                                    content: vec![],
+                                                },
+                                            })
+                                        ).await?;
+                                        send_notification(&mut tui_sink, &exchange,
+                                            ServerNotification::ReasoningSummaryTextDelta(
+                                                ReasoningSummaryTextDeltaNotification {
+                                                    thread_id: thread_id.clone(),
+                                                    turn_id: turn_id.clone(),
+                                                    item_id: reasoning_id.clone(),
+                                                    delta: "**Thinking**\n\n".to_string(),
+                                                    summary_index: 0,
                                                 }
-                                            }),
-                                        };
-                                        let json = serde_json::to_string(&notif)?;
-                                        tui_sink.send(Message::text(json)).await?;
+                                            )
+                                        ).await?;
                                     } else if block_type == "tool_use" {
                                         let tool_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
                                         let is_wicket_tool = tool_name.contains("wicket");
@@ -732,19 +745,17 @@ pub async fn run(
                                         let text = inner.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
                                         if !text.is_empty() {
                                             if let Some(ref reasoning_id) = active_reasoning_item_id {
-                                                let notif = JsonRpcNotification {
-                                                    jsonrpc: "2.0".into(),
-                                                    method: "item/reasoning/summaryTextDelta".into(),
-                                                    params: serde_json::json!({
-                                                        "threadId": thread_id,
-                                                        "turnId": turn_id,
-                                                        "itemId": reasoning_id,
-                                                        "delta": text,
-                                                        "summaryIndex": 0
-                                                    }),
-                                                };
-                                                let json = serde_json::to_string(&notif)?;
-                                                tui_sink.send(Message::text(json)).await?;
+                                                send_notification(&mut tui_sink, &exchange,
+                                                    ServerNotification::ReasoningSummaryTextDelta(
+                                                        ReasoningSummaryTextDeltaNotification {
+                                                            thread_id: thread_id.clone(),
+                                                            turn_id: turn_id.clone(),
+                                                            item_id: reasoning_id.clone(),
+                                                            delta: text.to_string(),
+                                                            summary_index: 0,
+                                                        }
+                                                    )
+                                                ).await?;
                                             }
                                         }
                                     } else if in_tool_use && inner_type == "input_json_delta" {
@@ -774,23 +785,18 @@ pub async fn run(
                                 "content_block_stop" => {
                                     if in_thinking {
                                         if let Some(reasoning_id) = active_reasoning_item_id.take() {
-                                            let notif = JsonRpcNotification {
-                                                jsonrpc: "2.0".into(),
-                                                method: "item/completed".into(),
-                                                params: serde_json::json!({
-                                                    "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
-                                                    "item": {
-                                                        "type": "reasoning",
-                                                        "id": reasoning_id,
-                                                        "summary": [],
-                                                        "content": []
-                                                    }
-                                                }),
-                                            };
-                                            let json = serde_json::to_string(&notif)?;
-                                            tui_sink.send(Message::text(json)).await?;
+                                            send_notification(&mut tui_sink, &exchange,
+                                                ServerNotification::ItemCompleted(ItemCompletedNotification {
+                                                    thread_id: thread_id.clone(),
+                                                    turn_id: turn_id.clone(),
+                                                    completed_at_ms: chrono::Utc::now().timestamp_millis(),
+                                                    item: ThreadItem::Reasoning {
+                                                        id: reasoning_id,
+                                                        summary: vec![],
+                                                        content: vec![],
+                                                    },
+                                                })
+                                            ).await?;
                                         }
                                         in_thinking = false;
                                     } else if in_tool_use {
