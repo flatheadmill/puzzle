@@ -22,6 +22,7 @@ pub enum WicketEvent {
     ToolDone(Value),
     ShellResult(Value),
     Lifecycle(String),
+    Turn(Value),
     Approval(Value),
     Meta(Value),
     Error(String),
@@ -89,6 +90,7 @@ impl WicketClient {
                             "tool_start" => WicketEvent::ToolStart(envelope.data),
                             "tool_done" => WicketEvent::ToolDone(envelope.data),
                             "shell_result" => WicketEvent::ShellResult(envelope.data),
+                            "turn" => WicketEvent::Turn(envelope.data),
                             "lifecycle" => {
                                 let name = envelope.data
                                     .as_str()
@@ -139,10 +141,12 @@ impl WicketClient {
         Ok(())
     }
 
-    pub fn send_claude_message(&self, message: &str) -> Result<(), std::io::Error> {
-        self.send_envelope("claude", serde_json::json!({
-            "message": message,
-        }))
+    pub fn send_claude_message(&self, message: &str, turn_id: Option<&str>) -> Result<(), std::io::Error> {
+        let mut data = serde_json::json!({ "message": message });
+        if let Some(tid) = turn_id {
+            data.as_object_mut().unwrap().insert("turn_id".to_string(), serde_json::json!(tid));
+        }
+        self.send_envelope("claude", data)
     }
 
     pub fn send_approval(&self, allow: bool, message: Option<&str>) -> Result<(), std::io::Error> {

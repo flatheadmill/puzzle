@@ -347,6 +347,8 @@ pub async fn run(
     let mut active_item_id: Option<String> = None;
     let mut active_tool_item_id: Option<String> = None;
     let mut active_tool_name: Option<String> = None;
+    let mut completed_tool_name: Option<String> = None;
+    let mut completed_tool_path: Option<String> = None;
     let mut active_reasoning_item_id: Option<String> = None;
     let mut in_tool_use: bool = false;
     let mut turn_interrupted: bool = false;
@@ -589,7 +591,7 @@ pub async fn run(
                                 tracing::info!(message, turn_id = %turn_id, "TUI: turn/start");
 
                                 if !message.is_empty() {
-                                    wicket.send_claude_message(message)?;
+                                    wicket.send_claude_message(message, Some(&turn_id))?;
                                 }
 
                                 // Respond with a Turn.
@@ -649,7 +651,7 @@ pub async fn run(
                                     }))
                                     .unwrap_or("");
                                 if !message.is_empty() {
-                                    wicket.send_claude_message(message)?;
+                                    wicket.send_claude_message(message, None)?;
                                 }
                                 send_response(&mut tui_sink, &exchange, id, serde_json::json!({})).await?;
                             }
@@ -935,7 +937,14 @@ pub async fn run(
                                             }
                                         }
                                         in_tool_use = false;
-                                        active_tool_name = None;
+                                        completed_tool_name = active_tool_name.take();
+                                        if completed_tool_name.as_deref().map(|n| n.contains("view_image")).unwrap_or(false) {
+                                            completed_tool_path = serde_json::from_str::<Value>(&tool_input_json)
+                                                .ok()
+                                                .and_then(|input| input.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()));
+                                        } else {
+                                            completed_tool_path = None;
+                                        }
                                     }
                                 }
                                 "message_delta" => {
@@ -1056,37 +1065,60 @@ pub async fn run(
 
                         if let Some(tool_item_id) = active_tool_item_id.take() {
                             let turn_id = active_turn_id.as_deref().unwrap_or("");
-                            let output = data.get("output").and_then(|v| v.as_str()).unwrap_or("");
                             let exit_code = data.get("exit_code").and_then(|v| v.as_i64());
+                            let is_image = completed_tool_name.as_deref().map(|n| n.contains("view_image")).unwrap_or(false);
 
-                            let output_notif = JsonRpcNotification {
-                                jsonrpc: "2.0".into(),
-                                method: "item/commandExecution/delta".into(),
-                                params: serde_json::json!({
-                                    "threadId": thread_id,
-                                    "turnId": turn_id,
-                                    "itemId": tool_item_id,
-                                    "delta": output
-                                }),
-                            };
-                            let json = serde_json::to_string(&output_notif)?;
-                            tui_sink.send(Message::text(json)).await?;
+                            if is_image {
+                                let image_path = completed_tool_path.take().unwrap_or_default();
+                                let completed_notif = JsonRpcNotification {
+                                    jsonrpc: "2.0".into(),
+                                    method: "item/completed".into(),
+                                    params: serde_json::json!({
+                                        "threadId": thread_id,
+                                        "turnId": turn_id,
+                                        "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                        "item": {
+                                            "type": "imageView",
+                                            "id": tool_item_id,
+                                            "path": image_path
+                                        }
+                                    }),
+                                };
+                                let json = serde_json::to_string(&completed_notif)?;
+                                exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
+                                tui_sink.send(Message::text(json)).await?;
+                                completed_tool_name = None;
+                            } else {
+                                let output = data.get("output").and_then(|v| v.as_str()).unwrap_or("");
 
-                            let status = if exit_code == Some(0) { "completed" } else { "failed" };
-                            let completed_notif = JsonRpcNotification {
-                                jsonrpc: "2.0".into(),
-                                method: "item/completed".into(),
-                                params: serde_json::json!({
-                                    "threadId": thread_id,
-                                    "turnId": turn_id,
-                                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
-                                    "item": {
-                                        "type": "commandExecution",
-                                        "id": tool_item_id,
-                                        "command": "",
-                                        "cwd": cwd,
-                                        "source": "agent",
-                                        "status": status,
+                                let output_notif = JsonRpcNotification {
+                                    jsonrpc: "2.0".into(),
+                                    method: "item/commandExecution/delta".into(),
+                                    params: serde_json::json!({
+                                        "threadId": thread_id,
+                                        "turnId": turn_id,
+                                        "itemId": tool_item_id,
+                                        "delta": output
+                                    }),
+                                };
+                                let json = serde_json::to_string(&output_notif)?;
+                                tui_sink.send(Message::text(json)).await?;
+
+                                let status = if exit_code == Some(0) { "completed" } else { "failed" };
+                                let completed_notif = JsonRpcNotification {
+                                    jsonrpc: "2.0".into(),
+                                    method: "item/completed".into(),
+                                    params: serde_json::json!({
+                                        "threadId": thread_id,
+                                        "turnId": turn_id,
+                                        "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                        "item": {
+                                            "type": "commandExecution",
+                                            "id": tool_item_id,
+                                            "command": "",
+                                            "cwd": cwd,
+                                            "source": "agent",
+                                            "status": status,
                                         "commandActions": [],
                                         "aggregatedOutput": output,
                                         "exitCode": exit_code,
@@ -1094,9 +1126,11 @@ pub async fn run(
                                     }
                                 }),
                             };
-                            let json = serde_json::to_string(&completed_notif)?;
-                            exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
-                            tui_sink.send(Message::text(json)).await?;
+                                let json = serde_json::to_string(&completed_notif)?;
+                                exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
+                                tui_sink.send(Message::text(json)).await?;
+                                completed_tool_name = None;
+                            }
                         }
                     }
                     Some(WicketEvent::ShellResult(data)) => {
@@ -1202,6 +1236,91 @@ pub async fn run(
                         };
                         let json = serde_json::to_string(&notif).unwrap_or_default();
                         let _ = tui_sink.send(Message::text(json)).await;
+                    }
+                    Some(WicketEvent::Turn(data)) => {
+                        let event = data.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                        let tid = data.get("turn_id").and_then(|v| v.as_str()).unwrap_or("");
+                        tracing::info!(event = %event, turn_id = %tid, "wicket turn event");
+
+                        match event {
+                            "started" => {
+                                if active_turn_id.is_some() {
+                                    tracing::debug!("turn_started from wicket ignored, already have active turn");
+                                } else {
+                                    let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                                    let item_id = uuid::Uuid::new_v4().to_string();
+                                    active_turn_id = Some(tid.to_string());
+                                    active_item_id = Some(item_id.clone());
+                                    tracing::info!(turn_id = %tid, "system turn started");
+
+                                    let notif = JsonRpcNotification {
+                                        jsonrpc: "2.0".into(),
+                                        method: "turn/started".into(),
+                                        params: serde_json::json!({
+                                            "threadId": thread_id,
+                                            "turn": {
+                                                "id": tid,
+                                                "items": [],
+                                                "itemsView": "full",
+                                                "status": "inProgress",
+                                                "error": null,
+                                                "startedAt": chrono::Utc::now().timestamp(),
+                                                "completedAt": null,
+                                                "durationMs": null
+                                            }
+                                        }),
+                                    };
+                                    let json = serde_json::to_string(&notif).unwrap_or_default();
+                                    exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json).unwrap_or_default());
+                                    let _ = tui_sink.send(Message::text(json)).await;
+
+                                    let user_msg_id = uuid::Uuid::new_v4().to_string();
+                                    let user_item_notif = JsonRpcNotification {
+                                        jsonrpc: "2.0".into(),
+                                        method: "item/completed".into(),
+                                        params: serde_json::json!({
+                                            "threadId": thread_id,
+                                            "turnId": tid,
+                                            "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                            "item": {
+                                                "type": "userMessage",
+                                                "id": user_msg_id,
+                                                "content": [{ "type": "text", "text": message }]
+                                            }
+                                        }),
+                                    };
+                                    let json = serde_json::to_string(&user_item_notif).unwrap_or_default();
+                                    exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json).unwrap_or_default());
+                                    let _ = tui_sink.send(Message::text(json)).await;
+
+                                    let item_notif = JsonRpcNotification {
+                                        jsonrpc: "2.0".into(),
+                                        method: "item/started".into(),
+                                        params: serde_json::json!({
+                                            "threadId": thread_id,
+                                            "turnId": tid,
+                                            "startedAtMs": chrono::Utc::now().timestamp_millis(),
+                                            "item": {
+                                                "type": "agentMessage",
+                                                "id": item_id,
+                                                "text": ""
+                                            }
+                                        }),
+                                    };
+                                    let json = serde_json::to_string(&item_notif).unwrap_or_default();
+                                    let _ = tui_sink.send(Message::text(json)).await;
+                                }
+                            }
+                            "completed" => {
+                                let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
+                                if let Some(ref current) = active_turn_id {
+                                    if current == tid {
+                                        tracing::debug!("turn completed from wicket for active turn, letting delta handler finish");
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     Some(WicketEvent::Lifecycle(name)) => {
                         tracing::info!(lifecycle = %name, "wicket lifecycle");
