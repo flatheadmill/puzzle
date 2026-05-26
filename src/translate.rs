@@ -23,6 +23,7 @@ struct JsonRpcMessage {
     id: Option<Value>,
     method: Option<String>,
     params: Option<Value>,
+    result: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -356,6 +357,8 @@ pub async fn run(
     let mut tool_input_json: String = String::new();
     let mut last_stop_reason: Option<String> = None;
     let mut pending_shell: Option<PendingShell> = None;
+    let mut pending_approval_request_id: Option<Value> = None;
+    let mut next_server_request_id: i64 = 1000;
 
     loop {
         tokio::select! {
@@ -373,6 +376,22 @@ pub async fn run(
                                 continue;
                             }
                         };
+
+                        if rpc.method.is_none() && rpc.result.is_some() {
+                            if let Some(ref pending_id) = pending_approval_request_id {
+                                if rpc.id.as_ref() == Some(pending_id) {
+                                    let result = rpc.result.unwrap_or_default();
+                                    let decision = result.get("decision")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("decline");
+                                    tracing::info!(decision = %decision, "approval response from TUI");
+                                    let allow = matches!(decision, "accept" | "acceptForSession" | "acceptWithExecpolicyAmendment");
+                                    wicket.send_approval(allow, if allow { None } else { Some("User denied") })?;
+                                    pending_approval_request_id = None;
+                                }
+                            }
+                            continue;
+                        }
 
                         let method = rpc.method.as_deref().unwrap_or("");
                         let id = rpc.id.clone();
@@ -1378,6 +1397,43 @@ pub async fn run(
                     }
                     Some(WicketEvent::Approval(data)) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "approval", "data": &data}));
+
+                        let tool_name = data.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+                        let command = data.get("input")
+                            .and_then(|v| v.get("command"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(tool_name);
+                        let reason = data.get("input")
+                            .and_then(|v| v.get("reason"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+
+                        let request_id = next_server_request_id;
+                        next_server_request_id += 1;
+                        pending_approval_request_id = Some(serde_json::json!(request_id));
+
+                        let turn_id = active_turn_id.as_deref().unwrap_or("");
+                        let item_id = active_tool_item_id.as_deref()
+                            .or(active_item_id.as_deref())
+                            .unwrap_or("");
+
+                        let request = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "method": "item/commandExecution/requestApproval",
+                            "params": {
+                                "threadId": thread_id,
+                                "turnId": turn_id,
+                                "itemId": item_id,
+                                "startedAtMs": chrono::Utc::now().timestamp_millis(),
+                                "command": command,
+                                "reason": reason,
+                            }
+                        });
+                        let json = serde_json::to_string(&request).unwrap_or_default();
+                        exchange.log("puzzle>tui", &request);
+                        tracing::info!(command = %command, "sending approval request to TUI");
+                        let _ = tui_sink.send(Message::text(json)).await;
                     }
                     Some(WicketEvent::Meta(data)) => {
                         tracing::debug!("wicket meta: {}", data);
