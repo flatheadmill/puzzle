@@ -358,6 +358,7 @@ pub async fn run(
     let mut last_stop_reason: Option<String> = None;
     let mut pending_shell: Option<PendingShell> = None;
     let mut pending_approval_request_id: Option<Value> = None;
+    let mut pending_turn_start_response: Option<Value> = None;
     let mut next_server_request_id: i64 = 1000;
 
     loop {
@@ -593,7 +594,6 @@ pub async fn run(
 
                             "turn/start" => {
                                 let params = rpc.params.unwrap_or_default();
-                                // Extract text from input: [{type: "text", text: "..."}]
                                 let message = params.get("input")
                                     .and_then(|input| input.as_array())
                                     .and_then(|items| items.iter().find_map(|item| {
@@ -605,74 +605,39 @@ pub async fn run(
                                     }))
                                     .unwrap_or("");
 
-                                let turn_id = uuid::Uuid::new_v4().to_string();
-                                let item_id = uuid::Uuid::new_v4().to_string();
-                                tracing::info!(message, turn_id = %turn_id, "TUI: turn/start");
+                                tracing::info!(message, "TUI: turn/start, forwarding to wicket");
 
-                                if !message.is_empty() {
-                                    wicket.send_claude_message(message, Some(&turn_id))?;
-                                }
-
-                                // Respond with a Turn.
-                                send_response(&mut tui_sink, &exchange, id, serde_json::json!({
-                                    "turn": {
-                                        "id": turn_id,
-                                        "items": [{
-                                            "type": "userMessage",
-                                            "id": uuid::Uuid::new_v4().to_string(),
-                                            "content": [{ "type": "text", "text": message }]
-                                        }],
-                                        "itemsView": "full",
-                                        "status": "inProgress",
-                                        "startedAt": chrono::Utc::now().timestamp(),
-                                        "completedAt": null
-                                    }
-                                })).await?;
-
-                                // Send turn/started notification.
-                                let notif = JsonRpcNotification {
-                                    jsonrpc: "2.0".into(),
-                                    method: "turn/started".into(),
-                                    params: serde_json::json!({
-                                        "threadId": thread_id,
-                                        "turn": {
-                                            "id": turn_id,
-                                            "items": [],
-                                            "itemsView": "full",
-                                            "status": "inProgress",
-                                            "error": null,
-                                            "startedAt": chrono::Utc::now().timestamp(),
-                                            "completedAt": null,
-                                            "durationMs": null
-                                        }
-                                    }),
-                                };
-                                let notif_json = serde_json::to_string(&notif)?;
-                                exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&notif_json)?);
-                                tui_sink.send(Message::text(notif_json)).await?;
-
-                                // Store the active turn context for streaming.
-                                active_turn_id = Some(turn_id);
-                                active_item_id = Some(item_id);
-                            }
-
-                            "turn/steer" => {
-                                // Interjection during an active turn.
-                                let params = rpc.params.unwrap_or_default();
-                                let message = params.get("input")
-                                    .and_then(|input| input.as_array())
-                                    .and_then(|items| items.iter().find_map(|item| {
-                                        if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                                            item.get("text").and_then(|t| t.as_str())
-                                        } else {
-                                            None
-                                        }
-                                    }))
-                                    .unwrap_or("");
                                 if !message.is_empty() {
                                     wicket.send_claude_message(message, None)?;
                                 }
-                                send_response(&mut tui_sink, &exchange, id, serde_json::json!({})).await?;
+
+                                // Stash the pending turn/start response ID. We respond
+                                // when Wicket's turn:started broadcast arrives with
+                                // the Wicket-generated turn ID.
+                                pending_turn_start_response = Some(id);
+                            }
+
+                            "turn/steer" => {
+                                let params = rpc.params.unwrap_or_default();
+                                let expected_turn = params.get("expectedTurnId")
+                                    .and_then(|v| v.as_str());
+                                let message = params.get("input")
+                                    .and_then(|input| input.as_array())
+                                    .and_then(|items| items.iter().find_map(|item| {
+                                        if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                            item.get("text").and_then(|t| t.as_str())
+                                        } else {
+                                            None
+                                        }
+                                    }))
+                                    .unwrap_or("");
+                                tracing::info!(
+                                    expected_turn = ?expected_turn,
+                                    active_turn = ?active_turn_id,
+                                    message = %message,
+                                    "turn/steer received"
+                                );
+                                panic!("turn/steer received — expected_turn={:?} active_turn={:?} message={}", expected_turn, active_turn_id, message);
                             }
 
                             _ => {
@@ -1270,7 +1235,45 @@ pub async fn run(
                                     let item_id = uuid::Uuid::new_v4().to_string();
                                     active_turn_id = Some(tid.to_string());
                                     active_item_id = Some(item_id.clone());
-                                    tracing::info!(turn_id = %tid, "system turn started");
+
+                                    let is_tui_initiated = pending_turn_start_response.is_some();
+                                    tracing::info!(turn_id = %tid, tui_initiated = is_tui_initiated, "turn started");
+
+                                    if let Some(response_id) = pending_turn_start_response.take() {
+                                        send_response(&mut tui_sink, &exchange, response_id, serde_json::json!({
+                                            "turn": {
+                                                "id": tid,
+                                                "items": [{
+                                                    "type": "userMessage",
+                                                    "id": uuid::Uuid::new_v4().to_string(),
+                                                    "content": [{ "type": "text", "text": message }]
+                                                }],
+                                                "itemsView": "full",
+                                                "status": "inProgress",
+                                                "startedAt": chrono::Utc::now().timestamp(),
+                                                "completedAt": null
+                                            }
+                                        })).await?;
+                                    } else {
+                                        let user_msg_id = uuid::Uuid::new_v4().to_string();
+                                        let user_item_notif = JsonRpcNotification {
+                                            jsonrpc: "2.0".into(),
+                                            method: "item/completed".into(),
+                                            params: serde_json::json!({
+                                                "threadId": thread_id,
+                                                "turnId": tid,
+                                                "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                "item": {
+                                                    "type": "userMessage",
+                                                    "id": user_msg_id,
+                                                    "content": [{ "type": "text", "text": message }]
+                                                }
+                                            }),
+                                        };
+                                        let json = serde_json::to_string(&user_item_notif).unwrap_or_default();
+                                        exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json).unwrap_or_default());
+                                        let _ = tui_sink.send(Message::text(json)).await;
+                                    }
 
                                     let notif = JsonRpcNotification {
                                         jsonrpc: "2.0".into(),
@@ -1290,25 +1293,6 @@ pub async fn run(
                                         }),
                                     };
                                     let json = serde_json::to_string(&notif).unwrap_or_default();
-                                    exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json).unwrap_or_default());
-                                    let _ = tui_sink.send(Message::text(json)).await;
-
-                                    let user_msg_id = uuid::Uuid::new_v4().to_string();
-                                    let user_item_notif = JsonRpcNotification {
-                                        jsonrpc: "2.0".into(),
-                                        method: "item/completed".into(),
-                                        params: serde_json::json!({
-                                            "threadId": thread_id,
-                                            "turnId": tid,
-                                            "completedAtMs": chrono::Utc::now().timestamp_millis(),
-                                            "item": {
-                                                "type": "userMessage",
-                                                "id": user_msg_id,
-                                                "content": [{ "type": "text", "text": message }]
-                                            }
-                                        }),
-                                    };
-                                    let json = serde_json::to_string(&user_item_notif).unwrap_or_default();
                                     exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json).unwrap_or_default());
                                     let _ = tui_sink.send(Message::text(json)).await;
 
