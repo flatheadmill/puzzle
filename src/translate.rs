@@ -637,7 +637,21 @@ pub async fn run(
                                     message = %message,
                                     "turn/steer received"
                                 );
-                                panic!("turn/steer received — expected_turn={:?} active_turn={:?} message={}", expected_turn, active_turn_id, message);
+
+                                if active_turn_id.is_none() {
+                                    send_error(&mut tui_sink, &exchange, id, -32000,
+                                        "no active turn to steer".to_string()).await?;
+                                } else if expected_turn.is_some() && expected_turn != active_turn_id.as_deref() {
+                                    let actual = active_turn_id.as_deref().unwrap_or("");
+                                    let expected = expected_turn.unwrap_or("");
+                                    send_error(&mut tui_sink, &exchange, id, -32000,
+                                        format!("expected active turn id `{}` but found `{}`", expected, actual)).await?;
+                                } else {
+                                    if !message.is_empty() {
+                                        wicket.send_claude_message(message, None)?;
+                                    }
+                                    send_response(&mut tui_sink, &exchange, id, serde_json::json!({})).await?;
+                                }
                             }
 
                             _ => {
