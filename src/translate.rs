@@ -608,7 +608,7 @@ pub async fn run(
                                 tracing::info!(message, "TUI: turn/start, forwarding to wicket");
 
                                 if !message.is_empty() {
-                                    wicket.send_claude_message(message, None)?;
+                                    wicket.send_envelope("turn", serde_json::json!({ "message": message }))?;
                                 }
 
                                 // Stash the pending turn/start response ID. We respond
@@ -648,9 +648,12 @@ pub async fn run(
                                         format!("expected active turn id `{}` but found `{}`", expected, actual)).await?;
                                 } else {
                                     if !message.is_empty() {
-                                        wicket.send_claude_message(message, None)?;
+                                        wicket.send_envelope("steer", serde_json::json!({ "message": message }))?;
                                     }
-                                    send_response(&mut tui_sink, &exchange, id, serde_json::json!({})).await?;
+                                    let tid = active_turn_id.as_deref().unwrap_or("");
+                                    send_response(&mut tui_sink, &exchange, id, serde_json::json!({
+                                        "turnId": tid
+                                    })).await?;
                                 }
                             }
 
