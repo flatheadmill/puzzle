@@ -359,6 +359,7 @@ pub async fn run(
     let mut pending_shell: Option<PendingShell> = None;
     let mut pending_approval_request_id: Option<Value> = None;
     let mut pending_turn_start_response: Option<Value> = None;
+    let mut pending_turn_start_message: Option<String> = None;
     let mut next_server_request_id: i64 = 1000;
 
     loop {
@@ -611,10 +612,8 @@ pub async fn run(
                                     wicket.send_envelope("turn", serde_json::json!({ "message": message }))?;
                                 }
 
-                                // Stash the pending turn/start response ID. We respond
-                                // when Wicket's turn:started broadcast arrives with
-                                // the Wicket-generated turn ID.
                                 pending_turn_start_response = Some(id);
+                                pending_turn_start_message = Some(message.to_string());
                             }
 
                             "turn/steer" => {
@@ -1248,12 +1247,12 @@ pub async fn run(
                                 if active_turn_id.is_some() {
                                     tracing::debug!("turn_started from wicket ignored, already have active turn");
                                 } else {
-                                    let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
                                     let item_id = uuid::Uuid::new_v4().to_string();
                                     active_turn_id = Some(tid.to_string());
                                     active_item_id = Some(item_id.clone());
 
                                     let is_tui_initiated = pending_turn_start_response.is_some();
+                                    let message = pending_turn_start_message.take().unwrap_or_default();
                                     tracing::info!(turn_id = %tid, tui_initiated = is_tui_initiated, "turn started");
 
                                     if let Some(response_id) = pending_turn_start_response.take() {
@@ -1271,25 +1270,6 @@ pub async fn run(
                                                 "completedAt": null
                                             }
                                         })).await?;
-                                    } else {
-                                        let user_msg_id = uuid::Uuid::new_v4().to_string();
-                                        let user_item_notif = JsonRpcNotification {
-                                            jsonrpc: "2.0".into(),
-                                            method: "item/completed".into(),
-                                            params: serde_json::json!({
-                                                "threadId": thread_id,
-                                                "turnId": tid,
-                                                "completedAtMs": chrono::Utc::now().timestamp_millis(),
-                                                "item": {
-                                                    "type": "userMessage",
-                                                    "id": user_msg_id,
-                                                    "content": [{ "type": "text", "text": message }]
-                                                }
-                                            }),
-                                        };
-                                        let json = serde_json::to_string(&user_item_notif).unwrap_or_default();
-                                        exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json).unwrap_or_default());
-                                        let _ = tui_sink.send(Message::text(json)).await;
                                     }
 
                                     let notif = JsonRpcNotification {
@@ -1436,7 +1416,7 @@ pub async fn run(
                         tracing::info!(command = %command, "sending approval request to TUI");
                         let _ = tui_sink.send(Message::text(json)).await;
                     }
-                    Some(WicketEvent::CommittedUserMessage(text)) => {
+                    Some(WicketEvent::UserMessage(text)) => {
                         let tid = active_turn_id.as_deref().unwrap_or("");
                         let msg_id = uuid::Uuid::new_v4().to_string();
                         let notif = JsonRpcNotification {
