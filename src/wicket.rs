@@ -21,6 +21,7 @@ pub enum WicketEvent {
     ToolStart(Value),
     ToolDone(Value),
     ShellResult(Value),
+    CommittedUserMessage(String),
     Lifecycle(String),
     Turn(Value),
     Approval(Value),
@@ -90,6 +91,14 @@ impl WicketClient {
                             "tool_start" => WicketEvent::ToolStart(envelope.data),
                             "tool_done" => WicketEvent::ToolDone(envelope.data),
                             "shell_result" => WicketEvent::ShellResult(envelope.data),
+                            "committed_user_message" => {
+                                let msg = envelope.data
+                                    .get("message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                WicketEvent::CommittedUserMessage(msg)
+                            }
                             "turn" => WicketEvent::Turn(envelope.data),
                             "lifecycle" => {
                                 let name = envelope.data
