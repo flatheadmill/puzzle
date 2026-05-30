@@ -1416,27 +1416,47 @@ pub async fn run(
                         tracing::info!(command = %command, "sending approval request to TUI");
                         let _ = tui_sink.send(Message::text(json)).await;
                     }
-                    Some(WicketEvent::UserMessage(text)) => {
+                    Some(WicketEvent::UserMessage { text, notification }) => {
                         let tid = active_turn_id.as_deref().unwrap_or("");
                         let msg_id = uuid::Uuid::new_v4().to_string();
-                        let notif = JsonRpcNotification {
-                            jsonrpc: "2.0".into(),
-                            method: "item/completed".into(),
-                            params: serde_json::json!({
-                                "threadId": thread_id,
-                                "turnId": tid,
-                                "completedAtMs": chrono::Utc::now().timestamp_millis(),
-                                "item": {
-                                    "type": "userMessage",
-                                    "id": msg_id,
-                                    "content": [{ "type": "text", "text": text }]
-                                }
-                            }),
+                        let is_system = notification;
+                        let item_type = if is_system { "agentMessage" } else { "userMessage" };
+                        let notif = if is_system {
+                            let clean = format!("**notification**: {}", text);
+                            JsonRpcNotification {
+                                jsonrpc: "2.0".into(),
+                                method: "item/completed".into(),
+                                params: serde_json::json!({
+                                    "threadId": thread_id,
+                                    "turnId": tid,
+                                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                    "item": {
+                                        "type": "agentMessage",
+                                        "id": msg_id,
+                                        "text": clean,
+                                    }
+                                }),
+                            }
+                        } else {
+                            JsonRpcNotification {
+                                jsonrpc: "2.0".into(),
+                                method: "item/completed".into(),
+                                params: serde_json::json!({
+                                    "threadId": thread_id,
+                                    "turnId": tid,
+                                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                    "item": {
+                                        "type": "userMessage",
+                                        "id": msg_id,
+                                        "content": [{ "type": "text", "text": text }]
+                                    }
+                                }),
+                            }
                         };
                         let json = serde_json::to_string(&notif).unwrap_or_default();
                         exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json).unwrap_or_default());
                         let _ = tui_sink.send(Message::text(json)).await;
-                        tracing::info!(message = %text, "committed user message sent to TUI");
+                        tracing::info!(message = %text, is_system, "user message sent to TUI");
                     }
                     Some(WicketEvent::Meta(data)) => {
                         tracing::debug!("wicket meta: {}", data);

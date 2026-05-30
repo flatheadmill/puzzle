@@ -21,7 +21,7 @@ pub enum WicketEvent {
     ToolStart(Value),
     ToolDone(Value),
     ShellResult(Value),
-    UserMessage(String),
+    UserMessage { text: String, notification: bool },
     Lifecycle(String),
     Turn(Value),
     Approval(Value),
@@ -45,7 +45,7 @@ impl WicketClient {
         // Send the connect payload.
         let payload = serde_json::json!({
             "slug": slug,
-            "protocol": "wicket",
+            "protocol": "easement",
             "timestamp": timestamp
         });
         sink.send(Message::text(payload.to_string()))
@@ -97,7 +97,11 @@ impl WicketClient {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                WicketEvent::UserMessage(msg)
+                                let notif = envelope.data
+                                    .get("notification")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                WicketEvent::UserMessage { text: msg, notification: notif }
                             }
                             "turn" => WicketEvent::Turn(envelope.data),
                             "lifecycle" => {

@@ -135,6 +135,19 @@ async fn main() -> Result<()> {
             Ok(Some(wicket::WicketEvent::Usage(usage))) => {
                 initial_usage = Some(usage);
             }
+            Ok(Some(wicket::WicketEvent::UserMessage { text, notification })) => {
+                if notification {
+                    history.push(serde_json::json!({
+                        "kind": "assistant",
+                        "blocks": [{ "type": "text", "text": format!("**notification**: {}", text) }],
+                    }));
+                } else {
+                    history.push(serde_json::json!({
+                        "kind": "user",
+                        "blocks": [{ "type": "text", "text": text }],
+                    }));
+                }
+            }
             Ok(Some(_)) => {}
             Ok(None) => break,
             Err(_) => break, // timeout — history burst is done
