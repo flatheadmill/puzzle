@@ -1344,9 +1344,23 @@ pub async fn run(
                     Some(WicketEvent::Usage(usage)) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "usage", "data": &usage}));
 
-                        let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let cached = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let (input, cached, output) = if let Some(iterations) = usage.get("iterations").and_then(|v| v.as_array()) {
+                            if let Some(last) = iterations.last() {
+                                (
+                                    last.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                                    last.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                                    last.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                                )
+                            } else {
+                                (0, 0, 0)
+                            }
+                        } else {
+                            (
+                                usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                                usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                                usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0),
+                            )
+                        };
                         let context_size = input + cached;
                         tracing::info!(input, cached, output, context_size, window = 1000000, "usage");
 
