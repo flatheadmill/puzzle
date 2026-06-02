@@ -1,7 +1,7 @@
-// Puzzle: protocol translator between the Codex TUI and Wicket.
+// Puzzle: protocol translator between the Codex TUI and Easement.
 //
+// Connects to Easement over WebSocket (bus protocol).
 // Listens on a Unix socket for the Codex TUI to connect (JSON-RPC/WebSocket).
-// Connects to Wicket as a WebSocket client (envelope protocol).
 // Launches the Codex TUI binary pointing it at the Unix socket.
 // Translates between the two protocols.
 
@@ -9,6 +9,7 @@ mod exchange;
 mod translate;
 mod wicket;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -55,9 +56,12 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     let slug = args.get(1).cloned().unwrap_or_else(|| {
-        eprintln!("usage: puzzle <slug> [--codex <path>]");
+        eprintln!("usage: puzzle <slug> [--codex <path>] [--full]");
         std::process::exit(1);
     });
+
+    let is_full = args.iter().any(|a| a == "--full");
+    let intent = if is_full { "full" } else { "latest" };
 
     let mut codex_path: Option<String> = None;
     let mut i = 2;
@@ -71,7 +75,7 @@ async fn main() -> Result<()> {
     }
 
     let _guard = init_tracing();
-    tracing::info!(slug = %slug, "puzzle starting");
+    tracing::info!(slug = %slug, intent = %intent, "puzzle starting");
 
     let home = std::env::var("HOME")?;
     let pane_dir = PathBuf::from(&home).join("pane").join(&slug);
@@ -79,8 +83,6 @@ async fn main() -> Result<()> {
 
     let exchange = ExchangeLog::new(&slug);
 
-    // Set up CODEX_HOME so the TUI discovers our socket.
-    // The socket goes at <codex_home>/app-server-control/app-server-control.sock
     let codex_home = pane_dir.join(".codex");
     let socket_dir = codex_home.join("app-server-control");
     std::fs::create_dir_all(&socket_dir)?;
@@ -91,51 +93,68 @@ async fn main() -> Result<()> {
     let listener = UnixListener::bind(&socket_path)?;
     tracing::info!(path = %socket_path.display(), "listening for codex TUI");
 
-    // Determine session timestamp: resume latest or create new with --new.
-    // Puzzle records its last-used timestamp in its own state directory.
-    let new_session = args.iter().any(|a| a == "--new");
-    let state_dir = PathBuf::from(&home)
-        .join(".local/state/puzzle")
-        .join(&slug);
-    let _ = std::fs::create_dir_all(&state_dir);
-    let timestamp_file = state_dir.join("timestamp");
-    let timestamp = if new_session {
-        let ts = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
-        let _ = std::fs::write(&timestamp_file, &ts);
-        ts
-    } else {
-        match std::fs::read_to_string(&timestamp_file) {
-            Ok(ts) if !ts.trim().is_empty() => ts.trim().to_string(),
-            _ => {
-                let ts = chrono::Local::now().format("%Y-%m-%d-%H-%M-%S").to_string();
-                let _ = std::fs::write(&timestamp_file, &ts);
-                ts
-            }
-        }
-    };
-    tracing::info!(timestamp = %timestamp, new = new_session, "session timestamp");
-
-    // Connect to Wicket and drain history before launching the TUI.
+    // Connect to Easement. No handshake.
     let wicket_url = "ws://127.0.0.1:6502";
-    let mut wicket = wicket::WicketClient::connect(wicket_url, &slug, Some(&timestamp)).await?;
-    tracing::info!("connected to wicket");
+    let mut wicket = wicket::WicketClient::connect(wicket_url).await?;
+    tracing::info!("connected to easement");
 
-    // Collect all history entries from Wicket. They arrive in a burst
-    // on connect. Wait for 200ms of silence to know the burst is done.
+    // Associate with slug so inbound messages route to the right coordinator.
+    wicket.associate_slug(&slug, "easement")?;
+
+    // Request history with a replay ID.
+    let replay_id = uuid::Uuid::new_v4().to_string();
+    wicket.request_history(&slug, intent, &replay_id)?;
+    tracing::info!(replay_id = %replay_id, intent = %intent, "history requested");
+
+    // Collect history entries by replay_id. Buffer live entries.
     let mut history: Vec<serde_json::Value> = vec![];
+    let mut live_buffer: Vec<wicket::WicketEvent> = vec![];
     let mut initial_usage: Option<serde_json::Value> = None;
+
     loop {
         match tokio::time::timeout(
-            std::time::Duration::from_millis(200),
+            std::time::Duration::from_secs(10),
             wicket.event_rx.recv(),
         ).await {
-            Ok(Some(wicket::WicketEvent::Entry(entry))) => {
-                history.push(entry);
+            Ok(Some(wicket::WicketEvent::Entry { data, replay_id: Some(rid) })) if rid == replay_id => {
+                history.push(data);
+            }
+            Ok(Some(wicket::WicketEvent::HistoryTerminate { replay_id: rid })) if rid == replay_id => {
+                tracing::info!(entries = history.len(), "history replay complete");
+                break;
             }
             Ok(Some(wicket::WicketEvent::Usage(usage))) => {
                 initial_usage = Some(usage);
             }
-            Ok(Some(wicket::WicketEvent::UserMessage { text, notification })) => {
+            Ok(Some(wicket::WicketEvent::Entry { data, replay_id: None })) => {
+                live_buffer.push(wicket::WicketEvent::Entry { data, replay_id: None });
+            }
+            Ok(Some(other)) => {
+                live_buffer.push(other);
+            }
+            Ok(None) => break,
+            Err(_) => {
+                tracing::warn!("history request timed out after 10s");
+                break;
+            }
+        }
+    }
+
+    // Dedup: remove live entries whose UUIDs are already in history.
+    let history_uuids: HashSet<String> = history.iter()
+        .filter_map(|e| e.get("uuid").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+
+    for event in live_buffer {
+        match event {
+            wicket::WicketEvent::Entry { ref data, .. } => {
+                let uuid = data.get("uuid").and_then(|v| v.as_str()).unwrap_or("");
+                if !uuid.is_empty() && history_uuids.contains(uuid) {
+                    continue;
+                }
+                history.push(data.clone());
+            }
+            wicket::WicketEvent::UserMessage { text, notification } => {
                 if notification {
                     history.push(serde_json::json!({
                         "kind": "assistant",
@@ -148,36 +167,32 @@ async fn main() -> Result<()> {
                     }));
                 }
             }
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(_) => break, // timeout — history burst is done
+            _ => {}
         }
     }
-    tracing::info!(entries = history.len(), "wicket history loaded");
 
-    // Launch the Codex TUI with CODEX_HOME pointing to our directory.
+    tracing::info!(entries = history.len(), "history loaded (with dedup)");
+
+    // Launch the Codex TUI.
     let codex_bin = codex_path.unwrap_or_else(|| "codex-tui".to_string());
     tracing::info!(bin = %codex_bin, codex_home = %codex_home.display(), "launching codex TUI");
 
     let mut tui_child = Command::new(&codex_bin)
         .env("CODEX_HOME", &codex_home)
         .env("PUZZLE_SLUG", &slug)
-        .env("PUZZLE_TIMESTAMP", &timestamp)
         .env("RUNNING_UNDER_PUZZLE", "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()?;
 
-    // Accept the TUI's connection and upgrade to WebSocket.
-    // The TUI probes the socket first (a bare TCP connect to check liveness),
-    // then does the real WebSocket connection. Loop until handshake succeeds.
+    // Accept the TUI's connection.
     tracing::info!("waiting for TUI connection");
     let ws_stream = loop {
         let (stream, _addr) = listener.accept().await?;
         match accept_async(stream).await {
             Ok(ws) => {
-                tracing::info!("TUI connected, websocket established");
+                tracing::info!("TUI connected");
                 break ws;
             }
             Err(e) => {
@@ -186,14 +201,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Run the translation loop with pre-loaded history.
     translate::run(ws_stream, wicket, exchange, &slug, history, initial_usage).await?;
 
-    // Wait for the TUI to exit.
     let status = tui_child.wait().await?;
     tracing::info!(code = ?status.code(), "codex TUI exited");
 
-    // Clean up.
     let _ = std::fs::remove_file(&socket_path);
 
     Ok(())

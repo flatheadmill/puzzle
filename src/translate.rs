@@ -1054,7 +1054,7 @@ pub async fn run(
                             }
                         }
                     }
-                    Some(WicketEvent::Entry(entry)) => {
+                    Some(WicketEvent::Entry { data: entry, .. }) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "entry", "data": &entry}));
                     }
                     Some(WicketEvent::ToolStart(data)) => {
@@ -1458,6 +1458,7 @@ pub async fn run(
                         let _ = tui_sink.send(Message::text(json)).await;
                         tracing::info!(message = %text, is_system, "user message sent to TUI");
                     }
+                    Some(WicketEvent::HistoryTerminate { .. }) => {}
                     Some(WicketEvent::Meta(data)) => {
                         tracing::debug!("wicket meta: {}", data);
                     }

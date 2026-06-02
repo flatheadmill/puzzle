@@ -1,22 +1,14 @@
-// Wicket WebSocket client. Connects to Wicket, sends envelopes, receives events.
-// Carried forward from the TUI era's claude.rs, simplified for the translator.
+// Easement WebSocket client. Connects, sends envelopes, receives bus messages.
 
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-#[derive(Debug, Deserialize)]
-struct InboundEnvelope {
-    stream: String,
-    data: Value,
-}
-
 #[derive(Debug)]
 pub enum WicketEvent {
     Delta(Value),
-    Entry(Value),
+    Entry { data: Value, replay_id: Option<String> },
     Usage(Value),
     ToolStart(Value),
     ToolDone(Value),
@@ -25,6 +17,7 @@ pub enum WicketEvent {
     Lifecycle(String),
     Turn(Value),
     Approval(Value),
+    HistoryTerminate { replay_id: String },
     Meta(Value),
     Error(String),
 }
@@ -35,29 +28,17 @@ pub struct WicketClient {
 }
 
 impl WicketClient {
-    pub async fn connect(url: &str, slug: &str, timestamp: Option<&str>) -> Result<Self, std::io::Error> {
+    pub async fn connect(url: &str) -> Result<Self, std::io::Error> {
         let (ws_stream, _) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))?;
 
         let (mut sink, stream) = ws_stream.split();
 
-        // Send the connect payload.
-        let payload = serde_json::json!({
-            "slug": slug,
-            "protocol": "easement",
-            "timestamp": timestamp
-        });
-        sink.send(Message::text(payload.to_string()))
-            .await
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+        tracing::info!("websocket connected");
 
-        tracing::info!(slug, timestamp = ?timestamp, "wicket connected");
-
-        // Outbound channel.
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<String>();
 
-        // Writer task.
         tokio::spawn(async move {
             while let Some(msg) = outbound_rx.recv().await {
                 if sink.send(Message::text(msg)).await.is_err() {
@@ -67,60 +48,62 @@ impl WicketClient {
             let _ = sink.close().await;
         });
 
-        // Inbound channel.
         let (event_tx, event_rx) = mpsc::channel::<WicketEvent>(256);
 
-        // Reader task.
         tokio::spawn(async move {
             let mut stream = stream;
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(Message::Text(text)) => {
-                        let envelope: InboundEnvelope = match serde_json::from_str(&text) {
-                            Ok(e) => e,
-                            Err(e) => {
-                                tracing::warn!("envelope parse error: {}", e);
-                                continue;
-                            }
+                        let msg: Value = match serde_json::from_str(&text) {
+                            Ok(v) => v,
+                            Err(_) => continue,
                         };
 
-                        let event = match envelope.stream.as_str() {
-                            "delta" => WicketEvent::Delta(envelope.data),
-                            "entry" => WicketEvent::Entry(envelope.data),
-                            "usage" => WicketEvent::Usage(envelope.data),
-                            "tool_start" => WicketEvent::ToolStart(envelope.data),
-                            "tool_done" => WicketEvent::ToolDone(envelope.data),
-                            "shell_result" => WicketEvent::ShellResult(envelope.data),
+                        let stream_name = msg.get("stream").and_then(|v| v.as_str()).unwrap_or("");
+                        let data = msg.get("data").cloned().unwrap_or_default();
+                        let replay_id = msg.get("replay_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+                        let event = match stream_name {
+                            "delta" => WicketEvent::Delta(data),
+                            "entry" => WicketEvent::Entry { data, replay_id },
+                            "history_terminate" => {
+                                if let Some(rid) = replay_id {
+                                    WicketEvent::HistoryTerminate { replay_id: rid }
+                                } else {
+                                    continue;
+                                }
+                            }
+                            "usage" => WicketEvent::Usage(data),
+                            "tool_start" => WicketEvent::ToolStart(data),
+                            "tool_done" => WicketEvent::ToolDone(data),
+                            "shell_result" => WicketEvent::ShellResult(data),
                             "user_message" => {
-                                let msg = envelope.data
-                                    .get("text")
+                                let text = data.get("text")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                let notif = envelope.data
-                                    .get("notification")
+                                let notif = data.get("notification")
                                     .and_then(|v| v.as_bool())
                                     .unwrap_or(false);
-                                WicketEvent::UserMessage { text: msg, notification: notif }
+                                WicketEvent::UserMessage { text, notification: notif }
                             }
-                            "turn" => WicketEvent::Turn(envelope.data),
+                            "turn" => WicketEvent::Turn(data),
                             "lifecycle" => {
-                                let name = envelope.data
-                                    .as_str()
+                                let name = data.as_str()
                                     .map(|s| s.to_string())
                                     .or_else(|| {
-                                        envelope.data.as_object()
+                                        data.as_object()
                                             .and_then(|m| m.keys().next())
                                             .map(|k| k.to_string())
                                     })
-                                    .unwrap_or_else(|| format!("{}", envelope.data));
+                                    .unwrap_or_else(|| format!("{}", data));
                                 WicketEvent::Lifecycle(name)
                             }
-                            "approval" => WicketEvent::Approval(envelope.data),
-                            "meta" => WicketEvent::Meta(envelope.data),
+                            "approval" => WicketEvent::Approval(data),
+                            "meta" => WicketEvent::Meta(data),
                             "error" => {
-                                let msg = envelope.data
-                                    .get("message")
+                                let msg = data.get("message")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("unknown error")
                                     .to_string();
@@ -135,7 +118,7 @@ impl WicketClient {
                     }
                     Ok(Message::Close(_)) => break,
                     Err(e) => {
-                        tracing::warn!("wicket read error: {}", e);
+                        tracing::warn!("websocket read error: {}", e);
                         break;
                     }
                     _ => {}
@@ -146,20 +129,28 @@ impl WicketClient {
         Ok(Self { outbound_tx, event_rx })
     }
 
-    pub fn send_envelope(&self, stream: &str, data: Value) -> Result<(), std::io::Error> {
-        let envelope = serde_json::json!({ "stream": stream, "data": data });
+    pub fn send_raw(&self, msg: &str) -> Result<(), std::io::Error> {
         self.outbound_tx
-            .send(envelope.to_string())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "channel closed"))?;
-        Ok(())
+            .send(msg.to_string())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "channel closed"))
     }
 
-    pub fn send_claude_message(&self, message: &str, turn_id: Option<&str>) -> Result<(), std::io::Error> {
-        let mut data = serde_json::json!({ "message": message });
-        if let Some(tid) = turn_id {
-            data.as_object_mut().unwrap().insert("turn_id".to_string(), serde_json::json!(tid));
-        }
-        self.send_envelope("claude", data)
+    pub fn send_envelope(&self, stream: &str, data: Value) -> Result<(), std::io::Error> {
+        let envelope = serde_json::json!({ "stream": stream, "data": data });
+        self.send_raw(&envelope.to_string())
+    }
+
+    pub fn associate_slug(&self, slug: &str, protocol: &str) -> Result<(), std::io::Error> {
+        let msg = serde_json::json!({ "slug": slug, "protocol": protocol });
+        self.send_raw(&msg.to_string())
+    }
+
+    pub fn request_history(&self, slug: &str, intent: &str, replay_id: &str) -> Result<(), std::io::Error> {
+        self.send_envelope("history_request", serde_json::json!({
+            "slug": slug,
+            "intent": intent,
+            "replay_id": replay_id,
+        }))
     }
 
     pub fn send_approval(&self, allow: bool, message: Option<&str>) -> Result<(), std::io::Error> {
