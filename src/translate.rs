@@ -1347,7 +1347,8 @@ pub async fn run(
                         let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
                         let cached = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
                         let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let total = input + cached + output;
+                        let context_size = input + cached;
+                        tracing::info!(input, cached, output, context_size, window = 1000000, "usage");
 
                         let notif = JsonRpcNotification {
                             jsonrpc: "2.0".into(),
@@ -1357,15 +1358,15 @@ pub async fn run(
                                 "turnId": active_turn_id.as_deref().unwrap_or(""),
                                 "tokenUsage": {
                                     "total": {
-                                        "totalTokens": total,
-                                        "inputTokens": input + cached,
+                                        "totalTokens": context_size,
+                                        "inputTokens": context_size,
                                         "cachedInputTokens": cached,
                                         "outputTokens": output,
                                         "reasoningOutputTokens": 0
                                     },
                                     "last": {
-                                        "totalTokens": total,
-                                        "inputTokens": input + cached,
+                                        "totalTokens": context_size,
+                                        "inputTokens": context_size,
                                         "cachedInputTokens": cached,
                                         "outputTokens": output,
                                         "reasoningOutputTokens": 0
