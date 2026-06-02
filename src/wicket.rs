@@ -1,8 +1,9 @@
 // Easement WebSocket client. Connects, sends envelopes, receives bus messages.
 
+use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Debug)]
@@ -17,7 +18,7 @@ pub enum WicketEvent {
     Lifecycle(String),
     Turn(Value),
     Approval(Value),
-    HistoryTerminate { replay_id: String },
+    HistoryTerminate { replay_id: String, timestamp: String },
     Meta(Value),
     Error(String),
 }
@@ -25,17 +26,21 @@ pub enum WicketEvent {
 pub struct WicketClient {
     outbound_tx: mpsc::UnboundedSender<String>,
     pub event_rx: mpsc::Receiver<WicketEvent>,
+    pub pinned_timestamp: Arc<RwLock<String>>,
 }
 
 impl WicketClient {
-    pub async fn connect(url: &str) -> Result<Self, std::io::Error> {
+    pub async fn connect(url: &str, slug: &str) -> Result<Self, std::io::Error> {
         let (ws_stream, _) = tokio_tungstenite::connect_async(url)
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))?;
 
         let (mut sink, stream) = ws_stream.split();
 
-        tracing::info!("websocket connected");
+        let my_slug = slug.to_string();
+        let pinned_timestamp = Arc::new(RwLock::new(String::new()));
+        let reader_ts = pinned_timestamp.clone();
+        tracing::info!(slug = %my_slug, "websocket connected");
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<String>();
 
@@ -60,6 +65,20 @@ impl WicketClient {
                             Err(_) => continue,
                         };
 
+                        if let Some(msg_slug) = msg.get("slug").and_then(|v| v.as_str()) {
+                            if msg_slug != my_slug {
+                                continue;
+                            }
+                            let ts = reader_ts.read().await;
+                            if !ts.is_empty() {
+                                if let Some(msg_ts) = msg.get("timestamp").and_then(|v| v.as_str()) {
+                                    if msg_ts != ts.as_str() {
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
                         let stream_name = msg.get("stream").and_then(|v| v.as_str()).unwrap_or("");
                         let data = msg.get("data").cloned().unwrap_or_default();
                         let replay_id = msg.get("replay_id").and_then(|v| v.as_str()).map(|s| s.to_string());
@@ -69,7 +88,8 @@ impl WicketClient {
                             "entry" => WicketEvent::Entry { data, replay_id },
                             "history_terminate" => {
                                 if let Some(rid) = replay_id {
-                                    WicketEvent::HistoryTerminate { replay_id: rid }
+                                    let msg_ts = msg.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    WicketEvent::HistoryTerminate { replay_id: rid, timestamp: msg_ts }
                                 } else {
                                     continue;
                                 }
@@ -126,7 +146,7 @@ impl WicketClient {
             }
         });
 
-        Ok(Self { outbound_tx, event_rx })
+        Ok(Self { outbound_tx, event_rx, pinned_timestamp })
     }
 
     pub fn send_raw(&self, msg: &str) -> Result<(), std::io::Error> {

@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
 
     // Connect to Easement. No handshake.
     let wicket_url = "ws://127.0.0.1:6502";
-    let mut wicket = wicket::WicketClient::connect(wicket_url).await?;
+    let mut wicket = wicket::WicketClient::connect(wicket_url, &slug).await?;
     tracing::info!("connected to easement");
 
     // Request history — this resolves the timestamp and creates the coordinator.
@@ -116,8 +116,11 @@ async fn main() -> Result<()> {
             Ok(Some(wicket::WicketEvent::Entry { data, replay_id: Some(rid) })) if rid == replay_id => {
                 history.push(data);
             }
-            Ok(Some(wicket::WicketEvent::HistoryTerminate { replay_id: rid })) if rid == replay_id => {
-                tracing::info!(entries = history.len(), "history replay complete");
+            Ok(Some(wicket::WicketEvent::HistoryTerminate { replay_id: rid, timestamp: ts })) if rid == replay_id => {
+                tracing::info!(entries = history.len(), timestamp = %ts, "history replay complete");
+                if !ts.is_empty() {
+                    *wicket.pinned_timestamp.write().await = ts;
+                }
                 break;
             }
             Ok(Some(wicket::WicketEvent::Usage(usage))) => {

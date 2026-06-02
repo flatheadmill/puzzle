@@ -1458,7 +1458,9 @@ pub async fn run(
                         let _ = tui_sink.send(Message::text(json)).await;
                         tracing::info!(message = %text, is_system, "user message sent to TUI");
                     }
-                    Some(WicketEvent::HistoryTerminate { .. }) => {}
+                    Some(WicketEvent::HistoryTerminate { .. }) => {
+                        tracing::debug!("history terminate (ignored in live mode)");
+                    }
                     Some(WicketEvent::Meta(data)) => {
                         tracing::debug!("wicket meta: {}", data);
                     }
