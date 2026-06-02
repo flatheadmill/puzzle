@@ -1,4 +1,48 @@
-// Translation loop between the Codex TUI (JSON-RPC/WebSocket) and Wicket (envelope/WebSocket).
+// Translation loop between the Codex TUI (JSON-RPC/WebSocket) and Easement (bus/WebSocket).
+
+// -- Config helpers --
+
+fn json_to_toml(v: &serde_json::Value) -> toml::Value {
+    match v {
+        serde_json::Value::Null => toml::Value::String(String::new()),
+        serde_json::Value::Bool(b) => toml::Value::Boolean(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                toml::Value::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                toml::Value::Float(f)
+            } else {
+                toml::Value::String(n.to_string())
+            }
+        }
+        serde_json::Value::String(s) => toml::Value::String(s.clone()),
+        serde_json::Value::Array(arr) => {
+            toml::Value::Array(arr.iter().map(json_to_toml).collect())
+        }
+        serde_json::Value::Object(obj) => {
+            let mut table = toml::map::Map::new();
+            for (k, v) in obj {
+                table.insert(k.clone(), json_to_toml(v));
+            }
+            toml::Value::Table(table)
+        }
+    }
+}
+
+fn set_nested_toml(root: &mut toml::Value, parts: &[&str], value: toml::Value) {
+    if parts.is_empty() { return; }
+    if parts.len() == 1 {
+        if let toml::Value::Table(table) = root {
+            table.insert(parts[0].to_string(), value);
+        }
+        return;
+    }
+    if let toml::Value::Table(table) = root {
+        let child = table.entry(parts[0].to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        set_nested_toml(child, &parts[1..], value);
+    }
+}
 
 use codex_app_server_protocol::{
     ServerNotification,
@@ -654,6 +698,102 @@ pub async fn run(
                                         "turnId": tid
                                     })).await?;
                                 }
+                            }
+
+                            "config/read" => {
+                                let codex_home = std::env::var("CODEX_HOME")
+                                    .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.codex", h)))
+                                    .unwrap_or_default();
+                                let config_path = std::path::Path::new(&codex_home).join("config.toml");
+                                let config: serde_json::Value = if config_path.exists() {
+                                    match std::fs::read_to_string(&config_path) {
+                                        Ok(content) => {
+                                            match toml::from_str::<toml::Value>(&content) {
+                                                Ok(toml_val) => serde_json::to_value(toml_val).unwrap_or_default(),
+                                                Err(_) => serde_json::json!({}),
+                                            }
+                                        }
+                                        Err(_) => serde_json::json!({}),
+                                    }
+                                } else {
+                                    serde_json::json!({})
+                                };
+                                send_response(&mut tui_sink, &exchange, id, serde_json::json!({
+                                    "config": config,
+                                    "origins": {},
+                                    "layers": null
+                                })).await?;
+                            }
+
+                            "config/value/write" => {
+                                let params = rpc.params.unwrap_or_default();
+                                let codex_home = std::env::var("CODEX_HOME")
+                                    .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.codex", h)))
+                                    .unwrap_or_default();
+                                let config_path = std::path::Path::new(&codex_home).join("config.toml");
+                                let key_path = params.get("keyPath").and_then(|v| v.as_str()).unwrap_or("");
+                                let value = params.get("value").cloned().unwrap_or_default();
+
+                                let mut config: toml::Value = if config_path.exists() {
+                                    match std::fs::read_to_string(&config_path) {
+                                        Ok(content) => toml::from_str(&content).unwrap_or(toml::Value::Table(toml::map::Map::new())),
+                                        Err(_) => toml::Value::Table(toml::map::Map::new()),
+                                    }
+                                } else {
+                                    toml::Value::Table(toml::map::Map::new())
+                                };
+
+                                let parts: Vec<&str> = key_path.split('.').collect();
+                                if !parts.is_empty() {
+                                    let toml_value = json_to_toml(&value);
+                                    set_nested_toml(&mut config, &parts, toml_value);
+                                    if let Ok(content) = toml::to_string_pretty(&config) {
+                                        let _ = std::fs::write(&config_path, content);
+                                    }
+                                }
+
+                                send_response(&mut tui_sink, &exchange, id, serde_json::json!({
+                                    "status": "ok",
+                                    "version": "1",
+                                    "filePath": config_path.to_string_lossy()
+                                })).await?;
+                            }
+
+                            "config/batchWrite" => {
+                                let params = rpc.params.unwrap_or_default();
+                                let codex_home = std::env::var("CODEX_HOME")
+                                    .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.codex", h)))
+                                    .unwrap_or_default();
+                                let config_path = std::path::Path::new(&codex_home).join("config.toml");
+
+                                let mut config: toml::Value = if config_path.exists() {
+                                    match std::fs::read_to_string(&config_path) {
+                                        Ok(content) => toml::from_str(&content).unwrap_or(toml::Value::Table(toml::map::Map::new())),
+                                        Err(_) => toml::Value::Table(toml::map::Map::new()),
+                                    }
+                                } else {
+                                    toml::Value::Table(toml::map::Map::new())
+                                };
+
+                                if let Some(edits) = params.get("edits").and_then(|v| v.as_array()) {
+                                    for edit in edits {
+                                        let key_path = edit.get("keyPath").and_then(|v| v.as_str()).unwrap_or("");
+                                        let value = edit.get("value").cloned().unwrap_or_default();
+                                        let parts: Vec<&str> = key_path.split('.').collect();
+                                        if !parts.is_empty() {
+                                            set_nested_toml(&mut config, &parts, json_to_toml(&value));
+                                        }
+                                    }
+                                }
+                                if let Ok(content) = toml::to_string_pretty(&config) {
+                                    let _ = std::fs::write(&config_path, content);
+                                }
+
+                                send_response(&mut tui_sink, &exchange, id, serde_json::json!({
+                                    "status": "ok",
+                                    "version": "1",
+                                    "filePath": config_path.to_string_lossy()
+                                })).await?;
                             }
 
                             _ => {
