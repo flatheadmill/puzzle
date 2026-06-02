@@ -98,10 +98,7 @@ async fn main() -> Result<()> {
     let mut wicket = wicket::WicketClient::connect(wicket_url).await?;
     tracing::info!("connected to easement");
 
-    // Associate with slug so inbound messages route to the right coordinator.
-    wicket.associate_slug(&slug, "easement")?;
-
-    // Request history with a replay ID.
+    // Request history — this resolves the timestamp and creates the coordinator.
     let replay_id = uuid::Uuid::new_v4().to_string();
     wicket.request_history(&slug, intent, &replay_id)?;
     tracing::info!(replay_id = %replay_id, intent = %intent, "history requested");
