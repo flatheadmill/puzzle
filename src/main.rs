@@ -82,8 +82,12 @@ async fn main() -> Result<()> {
     tracing::info!(path = %socket_path.display(), "listening for codex TUI");
 
     // Connect to Easement.
-    let wicket_url = "ws://127.0.0.1:6502";
-    let mut wicket = wicket::WicketClient::connect(wicket_url, &slug).await?;
+    let port = std::env::var("EASEMENT_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(6502);
+    let wicket_url = format!("ws://127.0.0.1:{}", port);
+    let mut wicket = wicket::WicketClient::connect(&wicket_url, &slug).await?;
     tracing::info!("connected to easement");
 
     // Request history.
