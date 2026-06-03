@@ -165,6 +165,28 @@ fn parse_patch_to_changes(patch: &str) -> Vec<Value> {
 }
 
 
+fn is_our_tool(name: &str) -> bool {
+    name.contains("wicket") || name.starts_with("mcp__o__")
+}
+
+fn tool_function(name: &str, input: &Value) -> Option<String> {
+    if name == "mcp__o__call" {
+        input.get("f").and_then(|v| v.as_str()).map(|s| s.to_string())
+    } else if name.contains("wicket") {
+        name.rsplit("__").next().map(|s| s.to_string())
+    } else {
+        None
+    }
+}
+
+fn tool_args<'a>(name: &str, input: &'a Value) -> &'a Value {
+    if name == "mcp__o__call" {
+        input.get("args").unwrap_or(input)
+    } else {
+        input
+    }
+}
+
 fn is_interrupt_marker(entry: &Value) -> bool {
     let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     if kind != "user" { return false; }
@@ -256,9 +278,13 @@ fn build_turns_from_entries(entries: &[Value]) -> Vec<Value> {
                     }
                     ("assistant", "tool_use") => {
                         let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                        if !name.contains("wicket") {
+                        if !is_our_tool(name) {
                             continue;
                         }
+
+                        let input = block.get("input").unwrap_or(&Value::Null);
+                        let f = tool_function(name, input).unwrap_or_default();
+                        let args = tool_args(name, input);
 
                         let mut tool_output = String::new();
                         if i + 1 < entries.len() {
@@ -277,9 +303,8 @@ fn build_turns_from_entries(entries: &[Value]) -> Vec<Value> {
                             }
                         }
 
-                        if name.contains("apply_patch") {
-                            let patch = block.get("input")
-                                .and_then(|input| input.get("patch"))
+                        if f == "apply_patch" {
+                            let patch = args.get("patch")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
                             let changes = parse_patch_to_changes(patch);
@@ -290,10 +315,9 @@ fn build_turns_from_entries(entries: &[Value]) -> Vec<Value> {
                                 "status": "completed"
                             }));
                         } else {
-                            let command = block.get("input")
-                                .and_then(|input| input.get("command"))
+                            let command = args.get("command")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or(name);
+                                .unwrap_or(&f);
                             current_items.push(serde_json::json!({
                                 "type": "commandExecution",
                                 "id": uuid,
@@ -392,7 +416,8 @@ pub async fn run(
     let mut active_item_id: Option<String> = None;
     let mut active_tool_item_id: Option<String> = None;
     let mut active_tool_name: Option<String> = None;
-    let mut completed_tool_name: Option<String> = None;
+    let mut active_tool_f: Option<String> = None;
+    let mut completed_tool_f: Option<String> = None;
     let mut completed_tool_path: Option<String> = None;
     let mut active_reasoning_item_id: Option<String> = None;
     let mut in_tool_use: bool = false;
@@ -858,13 +883,13 @@ pub async fn run(
                                         ).await?;
                                     } else if block_type == "tool_use" {
                                         let tool_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                        let is_wicket_tool = tool_name.contains("wicket");
 
                                         in_tool_use = true;
                                         tool_input_json.clear();
                                         active_tool_name = Some(tool_name.to_string());
+                                        active_tool_f = None;
 
-                                        if is_wicket_tool {
+                                        if is_our_tool(tool_name) {
                                             let tool_item_id = uuid::Uuid::new_v4().to_string();
                                             active_tool_item_id = Some(tool_item_id.clone());
                                         }
@@ -979,15 +1004,15 @@ pub async fn run(
                                         in_thinking = false;
                                     } else if in_tool_use {
                                         if let Some(ref tool_item_id) = active_tool_item_id {
-                                            let tool = active_tool_name.as_deref().unwrap_or("");
-                                            let is_patch = tool.contains("apply_patch");
-                                            let is_view_image = tool.contains("view_image");
+                                            let tool_name = active_tool_name.as_deref().unwrap_or("");
+                                            let parsed_input = serde_json::from_str::<Value>(&tool_input_json).unwrap_or_default();
+                                            let f = tool_function(tool_name, &parsed_input).unwrap_or_default();
+                                            let args = tool_args(tool_name, &parsed_input);
 
-                                            if is_view_image {
-                                                let image_path = serde_json::from_str::<Value>(&tool_input_json)
-                                                    .ok()
-                                                    .and_then(|input| input.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                                                    .unwrap_or_default();
+                                            active_tool_f = Some(f.clone());
+
+                                            if f == "view_image" {
+                                                let image_path = args.get("path").and_then(|v| v.as_str()).unwrap_or_default();
 
                                                 let started_notif = JsonRpcNotification {
                                                     jsonrpc: "2.0".into(),
@@ -1006,13 +1031,9 @@ pub async fn run(
                                                 let json = serde_json::to_string(&started_notif)?;
                                                 exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
                                                 tui_sink.send(Message::text(json)).await?;
-                                            } else if is_patch {
-                                                let patch = serde_json::from_str::<Value>(&tool_input_json)
-                                                    .ok()
-                                                    .and_then(|input| input.get("patch").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                                                    .unwrap_or_default();
-
-                                                let changes = parse_patch_to_changes(&patch);
+                                            } else if f == "apply_patch" {
+                                                let patch = args.get("patch").and_then(|v| v.as_str()).unwrap_or_default();
+                                                let changes = parse_patch_to_changes(patch);
 
                                                 let started_notif = JsonRpcNotification {
                                                     jsonrpc: "2.0".into(),
@@ -1045,46 +1066,46 @@ pub async fn run(
                                                 let json = serde_json::to_string(&patch_notif)?;
                                                 tui_sink.send(Message::text(json)).await?;
                                             } else {
-                                                let command = serde_json::from_str::<Value>(&tool_input_json)
-                                                    .ok()
-                                                    .and_then(|input| input.get("command").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                                                    .unwrap_or_else(|| tool_input_json.clone());
+                                                let command = args.get("command")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or(&f);
 
                                                 let started_notif = JsonRpcNotification {
                                                     jsonrpc: "2.0".into(),
                                                     method: "item/started".into(),
                                                     params: serde_json::json!({
                                                         "threadId": thread_id,
-                                                    "turnId": turn_id,
-                                                    "startedAtMs": chrono::Utc::now().timestamp_millis(),
-                                                    "item": {
-                                                        "type": "commandExecution",
-                                                        "id": tool_item_id,
-                                                        "command": command,
-                                                        "cwd": cwd,
-                                                        "source": "agent",
-                                                        "status": "inProgress",
-                                                        "commandActions": [],
-                                                        "aggregatedOutput": null,
-                                                        "exitCode": null,
-                                                        "durationMs": null
-                                                    }
-                                                }),
-                                            };
-                                            let json = serde_json::to_string(&started_notif)?;
-                                            exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
-                                            tui_sink.send(Message::text(json)).await?;
+                                                        "turnId": turn_id,
+                                                        "startedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                        "item": {
+                                                            "type": "commandExecution",
+                                                            "id": tool_item_id,
+                                                            "command": command,
+                                                            "cwd": cwd,
+                                                            "source": "agent",
+                                                            "status": "inProgress",
+                                                            "commandActions": [],
+                                                            "aggregatedOutput": null,
+                                                            "exitCode": null,
+                                                            "durationMs": null
+                                                        }
+                                                    }),
+                                                };
+                                                let json = serde_json::to_string(&started_notif)?;
+                                                exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
+                                                tui_sink.send(Message::text(json)).await?;
                                             }
                                         }
                                         in_tool_use = false;
-                                        completed_tool_name = active_tool_name.take();
-                                        if completed_tool_name.as_deref().map(|n| n.contains("view_image")).unwrap_or(false) {
-                                            completed_tool_path = serde_json::from_str::<Value>(&tool_input_json)
-                                                .ok()
-                                                .and_then(|input| input.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()));
+                                        completed_tool_f = active_tool_f.take();
+                                        if completed_tool_f.as_deref() == Some("view_image") {
+                                            let parsed = serde_json::from_str::<Value>(&tool_input_json).unwrap_or_default();
+                                            let args = tool_args(active_tool_name.as_deref().unwrap_or(""), &parsed);
+                                            completed_tool_path = args.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
                                         } else {
                                             completed_tool_path = None;
                                         }
+                                        active_tool_name = None;
                                     }
                                 }
                                 "message_delta" => {
@@ -1206,7 +1227,7 @@ pub async fn run(
                         if let Some(tool_item_id) = active_tool_item_id.take() {
                             let turn_id = active_turn_id.as_deref().unwrap_or("");
                             let exit_code = data.get("exit_code").and_then(|v| v.as_i64());
-                            let is_image = completed_tool_name.as_deref().map(|n| n.contains("view_image")).unwrap_or(false);
+                            let is_image = completed_tool_f.as_deref() == Some("view_image");
 
                             if is_image {
                                 let image_path = completed_tool_path.take().unwrap_or_default();
@@ -1227,7 +1248,7 @@ pub async fn run(
                                 let json = serde_json::to_string(&completed_notif)?;
                                 exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
                                 tui_sink.send(Message::text(json)).await?;
-                                completed_tool_name = None;
+                                completed_tool_f = None;
                             } else {
                                 let output = data.get("output").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -1269,7 +1290,7 @@ pub async fn run(
                                 let json = serde_json::to_string(&completed_notif)?;
                                 exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json)?);
                                 tui_sink.send(Message::text(json)).await?;
-                                completed_tool_name = None;
+                                completed_tool_f = None;
                             }
                         }
                     }
