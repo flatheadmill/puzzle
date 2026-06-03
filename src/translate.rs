@@ -399,6 +399,40 @@ struct PendingShell {
     item_id: String,
 }
 
+fn parse_directive(command: &str) -> Option<(&str, &str)> {
+    let trimmed = command.trim();
+    if trimmed.contains('\n') {
+        return None;
+    }
+    let rest = trimmed.strip_prefix('#')?.trim_start();
+    let name_end = rest.find(|c: char| !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-')
+        .unwrap_or(rest.len());
+    if name_end == 0 {
+        return None;
+    }
+    let name = &rest[..name_end];
+    if !name.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return None;
+    }
+    let body = rest[name_end..].trim();
+    Some((name, body))
+}
+
+fn handle_directive(wicket: &WicketClient, name: &str, body: &str) -> Result<String, String> {
+    match name {
+        "host" => {
+            let hostname = body.trim();
+            if hostname.is_empty() {
+                return Err("usage: # host <target>".to_string());
+            }
+            wicket.send_envelope("host", serde_json::json!({ "hostname": hostname }))
+                .map_err(|e| format!("failed to send host switch: {}", e))?;
+            Ok(format!("switched to {}", hostname))
+        }
+        _ => Err(format!("unknown directive: {}", name)),
+    }
+}
+
 pub async fn run(
     tui_ws: WebSocketStream<UnixStream>,
     mut wicket: WicketClient,
@@ -597,6 +631,85 @@ pub async fn run(
                                     .unwrap_or("")
                                     .to_string();
                                 tracing::info!(command = %command, "shell command");
+
+                                if let Some((directive, body)) = parse_directive(&command) {
+                                    tracing::info!(directive = %directive, body = %body, "puzzle directive");
+                                    let result = handle_directive(&wicket, directive, body);
+                                    send_response(&mut tui_sink, &exchange, id, serde_json::json!({})).await?;
+
+                                    let dir_turn_id = uuid::Uuid::new_v4().to_string();
+                                    let dir_item_id = uuid::Uuid::new_v4().to_string();
+                                    let now = chrono::Utc::now().timestamp();
+                                    let (output, exit_code) = match result {
+                                        Ok(msg) => (msg, 0),
+                                        Err(msg) => (msg, 1),
+                                    };
+
+                                    let turn_notif = JsonRpcNotification {
+                                        jsonrpc: "2.0".into(),
+                                        method: "turn/started".into(),
+                                        params: serde_json::json!({
+                                            "threadId": thread_id,
+                                            "turn": {
+                                                "id": dir_turn_id,
+                                                "items": [],
+                                                "itemsView": "full",
+                                                "status": "inProgress",
+                                                "error": null,
+                                                "startedAt": now,
+                                                "completedAt": null,
+                                                "durationMs": null
+                                            }
+                                        }),
+                                    };
+                                    let json = serde_json::to_string(&turn_notif)?;
+                                    tui_sink.send(Message::text(json)).await?;
+
+                                    let item_notif = JsonRpcNotification {
+                                        jsonrpc: "2.0".into(),
+                                        method: "item/completed".into(),
+                                        params: serde_json::json!({
+                                            "threadId": thread_id,
+                                            "turnId": dir_turn_id,
+                                            "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                            "item": {
+                                                "type": "commandExecution",
+                                                "id": dir_item_id,
+                                                "command": format!("# {}{}{}", directive, if body.is_empty() { "" } else { " " }, body),
+                                                "cwd": cwd,
+                                                "source": "userShell",
+                                                "status": if exit_code == 0 { "completed" } else { "failed" },
+                                                "commandActions": [],
+                                                "aggregatedOutput": output,
+                                                "exitCode": exit_code,
+                                                "durationMs": null
+                                            }
+                                        }),
+                                    };
+                                    let json = serde_json::to_string(&item_notif)?;
+                                    tui_sink.send(Message::text(json)).await?;
+
+                                    let done_notif = JsonRpcNotification {
+                                        jsonrpc: "2.0".into(),
+                                        method: "turn/completed".into(),
+                                        params: serde_json::json!({
+                                            "threadId": thread_id,
+                                            "turn": {
+                                                "id": dir_turn_id,
+                                                "items": [],
+                                                "itemsView": "full",
+                                                "status": if exit_code == 0 { "completed" } else { "failed" },
+                                                "error": null,
+                                                "startedAt": now,
+                                                "completedAt": now,
+                                                "durationMs": null
+                                            }
+                                        }),
+                                    };
+                                    let json = serde_json::to_string(&done_notif)?;
+                                    tui_sink.send(Message::text(json)).await?;
+                                    continue;
+                                }
 
                                 send_response(&mut tui_sink, &exchange, id, serde_json::json!({})).await?;
 
