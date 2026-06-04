@@ -160,10 +160,6 @@ impl WicketClient {
         self.send_raw(&envelope.to_string())
     }
 
-    pub fn associate_slug(&self, slug: &str, protocol: &str) -> Result<(), std::io::Error> {
-        let msg = serde_json::json!({ "slug": slug, "protocol": protocol });
-        self.send_raw(&msg.to_string())
-    }
 
     pub fn request_history(&self, slug: &str, intent: &str, replay_id: &str) -> Result<(), std::io::Error> {
         self.send_envelope("history_request", serde_json::json!({

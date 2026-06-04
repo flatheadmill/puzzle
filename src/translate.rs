@@ -62,7 +62,8 @@ use crate::exchange::ExchangeLog;
 use crate::wicket::{WicketClient, WicketEvent};
 
 #[derive(Deserialize, Debug)]
-struct JsonRpcMessage {
+#[allow(dead_code)]
+ struct JsonRpcMessage {
     jsonrpc: Option<String>,
     id: Option<Value>,
     method: Option<String>,
@@ -1601,7 +1602,7 @@ pub async fn run(
                                 }
                             }
                             "completed" => {
-                                let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
+                                let _status = data.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
                                 if let Some(ref current) = active_turn_id {
                                     if current == tid {
                                         tracing::debug!("turn completed from wicket for active turn, letting delta handler finish");
@@ -1709,7 +1710,7 @@ pub async fn run(
                         let tid = active_turn_id.as_deref().unwrap_or("");
                         let msg_id = uuid::Uuid::new_v4().to_string();
                         let is_system = notification;
-                        let item_type = if is_system { "agentMessage" } else { "userMessage" };
+                        let _item_type = if is_system { "agentMessage" } else { "userMessage" };
                         let notif = if is_system {
                             let clean = format!("**notification**: {}", text);
                             JsonRpcNotification {

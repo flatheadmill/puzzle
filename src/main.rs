@@ -214,7 +214,7 @@ async fn main() -> Result<()> {
         codex_linux_sandbox_exe: None,
         main_execve_wrapper_exe: None,
     };
-    let exit_info = codex_tui::run_main(
+    let _exit_info = codex_tui::run_main(
         cli,
         paths,
         codex_config::LoaderOverrides::default(),
