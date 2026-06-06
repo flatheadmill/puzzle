@@ -59,7 +59,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::exchange::ExchangeLog;
-use crate::wicket::{WicketClient, WicketEvent};
+use crate::easement::{EasementClient, EasementEvent};
 
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
@@ -419,14 +419,14 @@ fn parse_directive(command: &str) -> Option<(&str, &str)> {
     Some((name, body))
 }
 
-fn handle_directive(wicket: &WicketClient, name: &str, body: &str) -> Result<String, String> {
+fn handle_directive(easement: &EasementClient, name: &str, body: &str) -> Result<String, String> {
     match name {
         "host" => {
             let hostname = body.trim();
             if hostname.is_empty() {
                 return Err("usage: # host <target>".to_string());
             }
-            wicket.send_envelope("host", serde_json::json!({ "hostname": hostname }))
+            easement.send_envelope("host", serde_json::json!({ "hostname": hostname }))
                 .map_err(|e| format!("failed to send host switch: {}", e))?;
             Ok(format!("switched to {}", hostname))
         }
@@ -436,7 +436,7 @@ fn handle_directive(wicket: &WicketClient, name: &str, body: &str) -> Result<Str
 
 pub async fn run(
     tui_ws: WebSocketStream<UnixStream>,
-    mut wicket: WicketClient,
+    mut easement: EasementClient,
     exchange: ExchangeLog,
     slug: &str,
     history: Vec<Value>,
@@ -492,7 +492,7 @@ pub async fn run(
                                         .unwrap_or("decline");
                                     tracing::info!(decision = %decision, "approval response from TUI");
                                     let allow = matches!(decision, "accept" | "acceptForSession" | "acceptWithExecpolicyAmendment");
-                                    wicket.send_approval(allow, if allow { None } else { Some("User denied") })?;
+                                    easement.send_approval(allow, if allow { None } else { Some("User denied") })?;
                                     pending_approval_request_id = None;
                                 }
                             }
@@ -621,7 +621,7 @@ pub async fn run(
                             "turn/interrupt" => {
                                 tracing::info!("turn interrupt");
                                 turn_interrupted = true;
-                                wicket.send_envelope("interrupt", serde_json::json!({}))?;
+                                easement.send_envelope("interrupt", serde_json::json!({}))?;
                                 send_response(&mut tui_sink, &exchange, id, serde_json::json!({})).await?;
                             }
 
@@ -635,7 +635,7 @@ pub async fn run(
 
                                 if let Some((directive, body)) = parse_directive(&command) {
                                     tracing::info!(directive = %directive, body = %body, "puzzle directive");
-                                    let result = handle_directive(&wicket, directive, body);
+                                    let result = handle_directive(&easement, directive, body);
                                     send_response(&mut tui_sink, &exchange, id, serde_json::json!({})).await?;
 
                                     let dir_turn_id = uuid::Uuid::new_v4().to_string();
@@ -764,7 +764,7 @@ pub async fn run(
                                 exchange.log("puzzle>tui", &serde_json::from_str::<Value>(&json).unwrap_or_default());
                                 tui_sink.send(Message::text(json)).await?;
 
-                                wicket.send_envelope("shell", serde_json::json!({
+                                easement.send_envelope("shell", serde_json::json!({
                                     "command": command,
                                     "turn_id": shell_turn_id,
                                     "item_id": shell_item_id
@@ -792,7 +792,7 @@ pub async fn run(
                                 tracing::info!(message, "TUI: turn/start, forwarding to wicket");
 
                                 if !message.is_empty() {
-                                    wicket.send_envelope("turn", serde_json::json!({ "message": message }))?;
+                                    easement.send_envelope("turn", serde_json::json!({ "message": message }))?;
                                 }
 
                                 pending_turn_start_response = Some(id);
@@ -830,7 +830,7 @@ pub async fn run(
                                         format!("expected active turn id `{}` but found `{}`", expected, actual)).await?;
                                 } else {
                                     if !message.is_empty() {
-                                        wicket.send_envelope("steer", serde_json::json!({ "message": message }))?;
+                                        easement.send_envelope("steer", serde_json::json!({ "message": message }))?;
                                     }
                                     let tid = active_turn_id.as_deref().unwrap_or("");
                                     send_response(&mut tui_sink, &exchange, id, serde_json::json!({
@@ -954,9 +954,9 @@ pub async fn run(
                 }
             }
 
-            event = wicket.event_rx.recv() => {
+            event = easement.event_rx.recv() => {
                 match event {
-                    Some(WicketEvent::Delta(delta)) => {
+                    Some(EasementEvent::Delta(delta)) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "delta", "data": &delta}));
 
                         if let Some(turn_id) = &active_turn_id {
@@ -1329,13 +1329,13 @@ pub async fn run(
                             }
                         }
                     }
-                    Some(WicketEvent::Entry { data: entry, .. }) => {
+                    Some(EasementEvent::Entry { data: entry, .. }) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "entry", "data": &entry}));
                     }
-                    Some(WicketEvent::ToolStart(data)) => {
+                    Some(EasementEvent::ToolStart(data)) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "tool_start", "data": &data}));
                     }
-                    Some(WicketEvent::ToolDone(data)) => {
+                    Some(EasementEvent::ToolDone(data)) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "tool_done", "data": &data}));
 
                         if let Some(tool_item_id) = active_tool_item_id.take() {
@@ -1408,7 +1408,7 @@ pub async fn run(
                             }
                         }
                     }
-                    Some(WicketEvent::ShellResult(data)) => {
+                    Some(EasementEvent::ShellResult(data)) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "shell_result", "data": &data}));
                         if let Some(shell) = pending_shell.take() {
                             let output = data.get("output").and_then(|v| v.as_str()).unwrap_or("");
@@ -1476,7 +1476,7 @@ pub async fn run(
                             tui_sink.send(Message::text(json)).await?;
                         }
                     }
-                    Some(WicketEvent::Usage(usage)) => {
+                    Some(EasementEvent::Usage(usage)) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "usage", "data": &usage}));
 
                         let (input, cached, output) = if let Some(iterations) = usage.get("iterations").and_then(|v| v.as_array()) {
@@ -1527,7 +1527,7 @@ pub async fn run(
                         let json = serde_json::to_string(&notif).unwrap_or_default();
                         let _ = tui_sink.send(Message::text(json)).await;
                     }
-                    Some(WicketEvent::Turn(data)) => {
+                    Some(EasementEvent::Turn(data)) => {
                         let event = data.get("event").and_then(|v| v.as_str()).unwrap_or("");
                         let tid = data.get("turn_id").and_then(|v| v.as_str()).unwrap_or("");
                         tracing::info!(event = %event, turn_id = %tid, "wicket turn event");
@@ -1612,7 +1612,7 @@ pub async fn run(
                             _ => {}
                         }
                     }
-                    Some(WicketEvent::Lifecycle(name)) => {
+                    Some(EasementEvent::Lifecycle(name)) => {
                         tracing::info!(lifecycle = %name, "wicket lifecycle");
                         if name == "round_interrupted" {
                             tracing::info!(active_turn = ?active_turn_id, "handling round_interrupted");
@@ -1666,7 +1666,7 @@ pub async fn run(
                             }
                         }
                     }
-                    Some(WicketEvent::Approval(data)) => {
+                    Some(EasementEvent::Approval(data)) => {
                         exchange.log("wicket>puzzle", &serde_json::json!({"type": "approval", "data": &data}));
 
                         let tool_name = data.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
@@ -1706,7 +1706,7 @@ pub async fn run(
                         tracing::info!(command = %command, "sending approval request to TUI");
                         let _ = tui_sink.send(Message::text(json)).await;
                     }
-                    Some(WicketEvent::UserMessage { text, notification }) => {
+                    Some(EasementEvent::UserMessage { text, notification }) => {
                         let tid = active_turn_id.as_deref().unwrap_or("");
                         let msg_id = uuid::Uuid::new_v4().to_string();
                         let is_system = notification;
@@ -1748,13 +1748,13 @@ pub async fn run(
                         let _ = tui_sink.send(Message::text(json)).await;
                         tracing::info!(message = %text, is_system, "user message sent to TUI");
                     }
-                    Some(WicketEvent::HistoryTerminate { .. }) => {
+                    Some(EasementEvent::HistoryTerminate { .. }) => {
                         tracing::debug!("history terminate (ignored in live mode)");
                     }
-                    Some(WicketEvent::Meta(data)) => {
+                    Some(EasementEvent::Meta(data)) => {
                         tracing::debug!("wicket meta: {}", data);
                     }
-                    Some(WicketEvent::Error(msg)) => {
+                    Some(EasementEvent::Error(msg)) => {
                         tracing::error!("wicket error: {}", msg);
                     }
                     None => {

@@ -1,22 +1,18 @@
+[workspace]
+members = [".", "tui"]
+
 [package]
 name = "puzzle"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-codex-app-server-protocol = { git = "https://github.com/openai/codex", rev = "7d47056e", package = "codex-app-server-protocol" }
-codex-tui = { git = "https://github.com/openai/codex", rev = "7d47056e", package = "codex-tui", default-features = false }
-codex-arg0 = { git = "https://github.com/openai/codex", rev = "7d47056e", package = "codex-arg0" }
-codex-config = { git = "https://github.com/openai/codex", rev = "7d47056e", package = "codex-config" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 color-eyre = "0.6"

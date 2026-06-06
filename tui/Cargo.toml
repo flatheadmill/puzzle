@@ -1,0 +1,11 @@
+[package]
+name = "puzzle-tui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+codex-tui = { git = "https://github.com/openai/codex", rev = "7d47056e", package = "codex-tui", default-features = false }
+codex-arg0 = { git = "https://github.com/openai/codex", rev = "7d47056e", package = "codex-arg0" }
+codex-config = { git = "https://github.com/openai/codex", rev = "7d47056e", package = "codex-config" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
