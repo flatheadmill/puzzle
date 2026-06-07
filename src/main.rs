@@ -86,7 +86,6 @@ enum Inbound {
     Delta { slug: String, transcript: String, event: Value },
     Usage { slug: String, transcript: String, #[serde(flatten)] usage: Value },
     Turn { slug: String, transcript: String, #[serde(flatten)] event: TurnInbound },
-    Lifecycle { slug: String, transcript: String, #[serde(flatten)] event: LifecycleInbound },
     UserMessage { slug: String, transcript: String, text: String },
 }
 
@@ -102,15 +101,6 @@ enum HistoryInbound {
 enum TurnInbound {
     Started { turn_id: String },
     Completed { turn_id: String, status: String },
-}
-
-#[derive(serde::Deserialize)]
-#[serde(tag = "why", rename_all = "snake_case")]
-enum LifecycleInbound {
-    RoundStarted,
-    RoundCompleted,
-    RoundInterrupted,
-    RoundFailed { message: String },
 }
 
 // What Puzzle sends to Easement.
@@ -157,7 +147,6 @@ enum EasementEvent {
     Usage(Value),
     TurnStarted { turn_id: String },
     TurnCompleted { turn_id: String, status: String },
-    Lifecycle(String),
     UserMessage { text: String },
 }
 
@@ -547,7 +536,6 @@ async fn main() -> Result<()> {
                         Inbound::Delta { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
                         Inbound::Usage { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
                         Inbound::Turn { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
-                        Inbound::Lifecycle { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
                         Inbound::UserMessage { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
                     };
                     if msg_slug != my_slug { continue; }
@@ -562,15 +550,6 @@ async fn main() -> Result<()> {
                         Inbound::Usage { usage, .. } => EasementEvent::Usage(usage),
                         Inbound::Turn { event: TurnInbound::Started { turn_id }, .. } => EasementEvent::TurnStarted { turn_id },
                         Inbound::Turn { event: TurnInbound::Completed { turn_id, status }, .. } => EasementEvent::TurnCompleted { turn_id, status },
-                        Inbound::Lifecycle { event, .. } => {
-                            let name = match event {
-                                LifecycleInbound::RoundStarted => "round_started",
-                                LifecycleInbound::RoundCompleted => "round_completed",
-                                LifecycleInbound::RoundInterrupted => "round_interrupted",
-                                LifecycleInbound::RoundFailed { .. } => "round_failed",
-                            };
-                            EasementEvent::Lifecycle(name.to_string())
-                        }
                         Inbound::UserMessage { text, .. } => EasementEvent::UserMessage { text },
                     };
                     if event_tx.send(event).await.is_err() { break; }
@@ -1200,12 +1179,67 @@ async fn main() -> Result<()> {
                         }
                         Some(EasementEvent::TurnCompleted { turn_id, status }) => {
                             trace!("puzzle", "easement", "turn_completed", "turn_id": turn_id, "status": status);
+                            if status == "interrupted" || status == "failed" {
+                                if let Some(turn_id_done) = active_turn_id.take() {
+                                    if let Some(tool_id) = active_tool_item_id.take() {
+                                        let notif = serde_json::json!({
+                                            "method": "item/completed",
+                                            "params": {
+                                                "threadId": thread_id,
+                                                "turnId": turn_id_done,
+                                                "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                "item": {
+                                                    "type": "commandExecution",
+                                                    "id": tool_id,
+                                                    "command": "", "cwd": cwd, "source": "agent",
+                                                    "status": status, "commandActions": [],
+                                                    "aggregatedOutput": null, "exitCode": null, "durationMs": null
+                                                }
+                                            }
+                                        });
+                                        let _ = futures_util::SinkExt::send(&mut tui_sink,
+                                            tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                    }
+                                    if let Some(ref item_id) = active_item_id {
+                                        let notif = serde_json::json!({
+                                            "method": "item/completed",
+                                            "params": {
+                                                "threadId": thread_id,
+                                                "turnId": turn_id_done,
+                                                "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                                "item": { "type": "agentMessage", "id": item_id, "text": "" }
+                                            }
+                                        });
+                                        let _ = futures_util::SinkExt::send(&mut tui_sink,
+                                            tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                    }
+                                    let notif = serde_json::json!({
+                                        "method": "turn/completed",
+                                        "params": {
+                                            "threadId": thread_id,
+                                            "turn": {
+                                                "id": turn_id_done,
+                                                "items": [], "itemsView": "full",
+                                                "status": status,
+                                                "startedAt": null,
+                                                "completedAt": chrono::Utc::now().timestamp(),
+                                            }
+                                        }
+                                    });
+                                    let _ = futures_util::SinkExt::send(&mut tui_sink,
+                                        tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                    active_item_id = None;
+                                    active_tool_name = None;
+                                    active_reasoning_item_id = None;
+                                    in_tool_use = false;
+                                    in_thinking = false;
+                                    tool_input_json.clear();
+                                    last_stop_reason = None;
+                                }
+                            }
                         }
                         Some(EasementEvent::Usage(usage)) => {
                             trace!("puzzle", "easement", "usage");
-                        }
-                        Some(EasementEvent::Lifecycle(name)) => {
-                            trace!("puzzle", "easement", "lifecycle", "name": name);
                         }
                         Some(EasementEvent::UserMessage { text }) => {
                             trace!("puzzle", "easement", "user_message", "text": text);
