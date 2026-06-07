@@ -87,6 +87,7 @@ enum Inbound {
     Usage { slug: String, transcript: String, #[serde(flatten)] usage: Value },
     Turn { slug: String, transcript: String, #[serde(flatten)] event: TurnInbound },
     UserMessage { slug: String, transcript: String, text: String },
+    ToolResult { slug: String, transcript: String, call_id: String, output: String, exit_code: i32 },
 }
 
 #[derive(serde::Deserialize)]
@@ -148,6 +149,7 @@ enum EasementEvent {
     TurnStarted { turn_id: String },
     TurnCompleted { turn_id: String, status: String },
     UserMessage { text: String },
+    ToolResult { call_id: String, output: String, exit_code: i32 },
 }
 
 fn send_outbound(tx: &tokio::sync::mpsc::UnboundedSender<String>, msg: Outbound) {
@@ -537,6 +539,7 @@ async fn main() -> Result<()> {
                         Inbound::Usage { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
                         Inbound::Turn { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
                         Inbound::UserMessage { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
+                        Inbound::ToolResult { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
                     };
                     if msg_slug != my_slug { continue; }
                     let event = match msg {
@@ -551,6 +554,7 @@ async fn main() -> Result<()> {
                         Inbound::Turn { event: TurnInbound::Started { turn_id }, .. } => EasementEvent::TurnStarted { turn_id },
                         Inbound::Turn { event: TurnInbound::Completed { turn_id, status }, .. } => EasementEvent::TurnCompleted { turn_id, status },
                         Inbound::UserMessage { text, .. } => EasementEvent::UserMessage { text },
+                        Inbound::ToolResult { call_id, output, exit_code, .. } => EasementEvent::ToolResult { call_id, output, exit_code },
                     };
                     if event_tx.send(event).await.is_err() { break; }
                 }
@@ -1236,6 +1240,48 @@ async fn main() -> Result<()> {
                                     tool_input_json.clear();
                                     last_stop_reason = None;
                                 }
+                            }
+                        }
+                        Some(EasementEvent::ToolResult { call_id, output, exit_code }) => {
+                            trace!("puzzle", "easement", "tool_result", "call_id": call_id, "exit_code": exit_code);
+                            if let Some(tool_item_id) = active_tool_item_id.take() {
+                                let turn_id = active_turn_id.as_deref().unwrap_or("");
+                                if !output.is_empty() {
+                                    let notif = serde_json::json!({
+                                        "method": "item/commandExecution/outputDelta",
+                                        "params": {
+                                            "threadId": thread_id,
+                                            "turnId": turn_id,
+                                            "itemId": tool_item_id,
+                                            "delta": output
+                                        }
+                                    });
+                                    let _ = futures_util::SinkExt::send(&mut tui_sink,
+                                        tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                }
+                                let status = if exit_code == 0 { "completed" } else { "failed" };
+                                let notif = serde_json::json!({
+                                    "method": "item/completed",
+                                    "params": {
+                                        "threadId": thread_id,
+                                        "turnId": turn_id,
+                                        "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                        "item": {
+                                            "type": "commandExecution",
+                                            "id": tool_item_id,
+                                            "command": "",
+                                            "cwd": cwd,
+                                            "source": "agent",
+                                            "status": status,
+                                            "commandActions": [],
+                                            "aggregatedOutput": output,
+                                            "exitCode": exit_code,
+                                            "durationMs": null
+                                        }
+                                    }
+                                });
+                                let _ = futures_util::SinkExt::send(&mut tui_sink,
+                                    tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
                             }
                         }
                         Some(EasementEvent::Usage(usage)) => {
