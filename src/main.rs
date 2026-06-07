@@ -342,10 +342,9 @@ fn build_turns_from_entries(entries: &[Value], cwd: &str) -> Vec<Turn> {
             continue;
         }
 
-        let kind = entry.get("who").and_then(|v| v.as_str()).unwrap_or("");
+        let kind = entry.get("who").and_then(|v| v.as_str()).expect("missing who");
         let blocks = entry.get("blocks").and_then(|v| v.as_array());
-        let entry_id = entry.get("uuid").and_then(|v| v.as_str())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string().leak());
+        let entry_id = entry.get("uuid").and_then(|v| v.as_str()).expect("missing uuid");
 
         if is_user_text_entry(entry) && !current_items.is_empty() {
             flush_turn(&mut turns, &mut current_items, TurnStatus::Completed);
@@ -380,7 +379,7 @@ fn build_turns_from_entries(entries: &[Value], cwd: &str) -> Vec<Turn> {
                         });
                     }
                     ("assistant", "tool_use") => {
-                        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let name = block.get("name").and_then(|v| v.as_str()).expect("missing tool name");
                         if !is_our_tool(name) {
                             continue;
                         }
