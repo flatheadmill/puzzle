@@ -1390,6 +1390,25 @@ async fn main() -> Result<()> {
                         }
                         Some(EasementEvent::UserMessage { text }) => {
                             trace!("puzzle", "easement", "user_message", "text": text);
+                            let turn_id = active_turn_id.as_deref().unwrap_or("");
+                            let item_id = uuid::Uuid::new_v4().to_string();
+                            let notif = serde_json::json!({
+                                "method": "item/completed",
+                                "params": {
+                                    "threadId": thread_id,
+                                    "turnId": turn_id,
+                                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                    "item": {
+                                        "type": "userMessage",
+                                        "id": item_id,
+                                        "content": [{
+                                            "type": "text",
+                                            "text": text,
+                                        }],
+                                    },
+                                },
+                            });
+                            send_tui(&mut tui_sink, notif).await;
                         }
                         Some(_) => {}
                         None => {
