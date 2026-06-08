@@ -87,7 +87,7 @@ enum Inbound {
     Usage { slug: String, transcript: String, #[serde(flatten)] usage: Value },
     Turn { slug: String, transcript: String, #[serde(flatten)] event: TurnInbound },
     UserMessage { slug: String, transcript: String, text: String },
-    ToolResult { slug: String, transcript: String, call_id: String, output: String, exit_code: i32 },
+    ToolResult { slug: String, transcript: String, tool_use_id: String, output: String, #[serde(default)] is_error: bool },
 }
 
 #[derive(serde::Deserialize)]
@@ -149,7 +149,7 @@ enum EasementEvent {
     TurnStarted { turn_id: String },
     TurnCompleted { turn_id: String, status: String },
     UserMessage { text: String },
-    ToolResult { call_id: String, output: String, exit_code: i32 },
+    ToolResult { tool_use_id: String, output: String, is_error: bool },
 }
 
 fn send_outbound(tx: &tokio::sync::mpsc::UnboundedSender<String>, msg: Outbound) {
@@ -554,7 +554,7 @@ async fn main() -> Result<()> {
                         Inbound::Turn { event: TurnInbound::Started { turn_id }, .. } => EasementEvent::TurnStarted { turn_id },
                         Inbound::Turn { event: TurnInbound::Completed { turn_id, status }, .. } => EasementEvent::TurnCompleted { turn_id, status },
                         Inbound::UserMessage { text, .. } => EasementEvent::UserMessage { text },
-                        Inbound::ToolResult { call_id, output, exit_code, .. } => EasementEvent::ToolResult { call_id, output, exit_code },
+                        Inbound::ToolResult { tool_use_id, output, is_error, .. } => EasementEvent::ToolResult { tool_use_id, output, is_error },
                     };
                     if event_tx.send(event).await.is_err() { break; }
                 }
@@ -662,8 +662,8 @@ async fn main() -> Result<()> {
         let mut active_turn_id: Option<String> = None;
         let mut active_item_id: Option<String> = None;
         let mut active_reasoning_item_id: Option<String> = None;
-        let mut active_tool_item_id: Option<String> = None;
         let mut active_tool_name: Option<String> = None;
+        let mut active_tool_use_id: Option<String> = None;
         let mut in_thinking = false;
         let mut in_tool_use = false;
         let mut tool_input_json = String::new();
@@ -972,8 +972,10 @@ async fn main() -> Result<()> {
                                                 block.get("name").and_then(|v| v.as_str())
                                                     .expect("missing tool name").to_string()
                                             );
-                                            let tool_item_id = uuid::Uuid::new_v4().to_string();
-                                            active_tool_item_id = Some(tool_item_id);
+                                            active_tool_use_id = Some(
+                                                block.get("id").and_then(|v| v.as_str())
+                                                    .expect("missing tool_use id").to_string()
+                                            );
                                         } else if block_type == "text" {
                                             if let Some(ref item_id) = active_item_id {
                                                 let notif = serde_json::json!({
@@ -1050,7 +1052,7 @@ async fn main() -> Result<()> {
                                             }
                                             in_thinking = false;
                                         } else if in_tool_use {
-                                            if let Some(ref tool_item_id) = active_tool_item_id {
+                                            if let Some(ref tool_item_id) = active_tool_use_id {
                                                 let tool_name = active_tool_name.as_deref().expect("missing");
                                                 let parsed_input = serde_json::from_str::<Value>(&tool_input_json).unwrap_or_default();
                                                 let f = tool_function(tool_name, &parsed_input).unwrap_or_default();
@@ -1114,33 +1116,6 @@ async fn main() -> Result<()> {
                                             }
                                             active_item_id = Some(uuid::Uuid::new_v4().to_string());
                                         } else {
-                                            // End of turn. Close any active tool item,
-                                            // close the agentMessage, complete the turn.
-                                            if let Some(tool_item_id) = active_tool_item_id.take() {
-                                                let notif = serde_json::json!({
-                                                    "method": "item/completed",
-                                                    "params": {
-                                                        "threadId": thread_id,
-                                                        "turnId": turn_id,
-                                                        "completedAtMs": chrono::Utc::now().timestamp_millis(),
-                                                        "item": {
-                                                            "type": "commandExecution",
-                                                            "id": tool_item_id,
-                                                            "command": "",
-                                                            "cwd": cwd,
-                                                            "source": "agent",
-                                                            "status": "completed",
-                                                            "commandActions": [],
-                                                            "aggregatedOutput": null,
-                                                            "exitCode": 0,
-                                                            "durationMs": null
-                                                        }
-                                                    }
-                                                });
-                                                let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                                    tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
-                                            }
-
                                             if let Some(ref item_id) = active_item_id {
                                                 let notif = serde_json::json!({
                                                     "method": "item/completed",
@@ -1185,7 +1160,7 @@ async fn main() -> Result<()> {
                             trace!("puzzle", "easement", "turn_completed", "turn_id": turn_id, "status": status);
                             if status == "interrupted" || status == "failed" {
                                 if let Some(turn_id_done) = active_turn_id.take() {
-                                    if let Some(tool_id) = active_tool_item_id.take() {
+                                    if let Some(tool_id) = active_tool_use_id.take() {
                                         let notif = serde_json::json!({
                                             "method": "item/completed",
                                             "params": {
@@ -1242,47 +1217,45 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
-                        Some(EasementEvent::ToolResult { call_id, output, exit_code }) => {
-                            trace!("puzzle", "easement", "tool_result", "call_id": call_id, "exit_code": exit_code);
-                            if let Some(tool_item_id) = active_tool_item_id.take() {
-                                let turn_id = active_turn_id.as_deref().unwrap_or("");
-                                if !output.is_empty() {
-                                    let notif = serde_json::json!({
-                                        "method": "item/commandExecution/outputDelta",
-                                        "params": {
-                                            "threadId": thread_id,
-                                            "turnId": turn_id,
-                                            "itemId": tool_item_id,
-                                            "delta": output
-                                        }
-                                    });
-                                    let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                        tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
-                                }
-                                let status = if exit_code == 0 { "completed" } else { "failed" };
+                        Some(EasementEvent::ToolResult { tool_use_id, output, is_error }) => {
+                            trace!("puzzle", "easement", "tool_result", "tool_use_id": tool_use_id, "is_error": is_error);
+                            let turn_id = active_turn_id.as_deref().unwrap_or("");
+                            if !output.is_empty() {
                                 let notif = serde_json::json!({
-                                    "method": "item/completed",
+                                    "method": "item/commandExecution/outputDelta",
                                     "params": {
                                         "threadId": thread_id,
                                         "turnId": turn_id,
-                                        "completedAtMs": chrono::Utc::now().timestamp_millis(),
-                                        "item": {
-                                            "type": "commandExecution",
-                                            "id": tool_item_id,
-                                            "command": "",
-                                            "cwd": cwd,
-                                            "source": "agent",
-                                            "status": status,
-                                            "commandActions": [],
-                                            "aggregatedOutput": output,
-                                            "exitCode": exit_code,
-                                            "durationMs": null
-                                        }
+                                        "itemId": tool_use_id,
+                                        "delta": output
                                     }
                                 });
                                 let _ = futures_util::SinkExt::send(&mut tui_sink,
                                     tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
                             }
+                            let status = if is_error { "failed" } else { "completed" };
+                            let notif = serde_json::json!({
+                                "method": "item/completed",
+                                "params": {
+                                    "threadId": thread_id,
+                                    "turnId": turn_id,
+                                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                                    "item": {
+                                        "type": "commandExecution",
+                                        "id": tool_use_id,
+                                        "command": "",
+                                        "cwd": cwd,
+                                        "source": "agent",
+                                        "status": status,
+                                        "commandActions": [],
+                                        "aggregatedOutput": output,
+                                        "exitCode": if is_error { 1 } else { 0 },
+                                        "durationMs": null
+                                    }
+                                }
+                            });
+                            let _ = futures_util::SinkExt::send(&mut tui_sink,
+                                tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
                         }
                         Some(EasementEvent::Usage(usage)) => {
                             trace!("puzzle", "easement", "usage");
