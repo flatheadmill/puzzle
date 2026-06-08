@@ -115,6 +115,8 @@ enum Inbound {
         slug: String,
         transcript: String,
         text: String,
+        #[serde(default)]
+        notification: bool,
     },
     ToolResult {
         slug: String,
@@ -226,6 +228,7 @@ enum EasementEvent {
     },
     UserMessage {
         text: String,
+        notification: bool,
     },
     ToolResult {
         tool_use_id: String,
@@ -679,6 +682,13 @@ fn is_interrupt_marker(entry: &Value) -> bool {
     if kind != "user" {
         return false;
     }
+    if entry
+        .get("notification")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
     entry
         .get("blocks")
         .and_then(|v| v.as_array())
@@ -740,6 +750,10 @@ fn build_turns_from_entries(entries: &[Value], cwd: &str) -> Vec<Turn> {
             .and_then(|v| v.as_str())
             .expect("missing who");
         let blocks = entry.get("blocks").and_then(|v| v.as_array());
+        let notification = entry
+            .get("notification")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let entry_id = entry
             .get("uuid")
             .and_then(|v| v.as_str())
@@ -755,12 +769,19 @@ fn build_turns_from_entries(entries: &[Value], cwd: &str) -> Vec<Turn> {
                 match (kind, btype) {
                     ("user", "text") => {
                         let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        current_items.push(ThreadItem::UserMessage {
-                            id: entry_id.to_string(),
-                            content: vec![UserInput::Text {
-                                text: text.to_string(),
-                            }],
-                        });
+                        if notification {
+                            current_items.push(ThreadItem::AgentMessage {
+                                id: entry_id.to_string(),
+                                text: format!("**notification**: {}", text),
+                            });
+                        } else {
+                            current_items.push(ThreadItem::UserMessage {
+                                id: entry_id.to_string(),
+                                content: vec![UserInput::Text {
+                                    text: text.to_string(),
+                                }],
+                            });
+                        }
                     }
                     ("assistant", "text") => {
                         let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -993,7 +1014,11 @@ async fn main() -> Result<()> {
                             event: TurnInbound::Completed { turn_id, status },
                             ..
                         } => EasementEvent::TurnCompleted { turn_id, status },
-                        Inbound::UserMessage { text, .. } => EasementEvent::UserMessage { text },
+                        Inbound::UserMessage {
+                            text,
+                            notification,
+                            ..
+                        } => EasementEvent::UserMessage { text, notification },
                         Inbound::ToolResult {
                             tool_use_id,
                             output,
@@ -1771,24 +1796,33 @@ async fn main() -> Result<()> {
                                 token_usage_notification(&thread_id, turn_id, &display),
                             ).await;
                         }
-                        Some(EasementEvent::UserMessage { text }) => {
+                        Some(EasementEvent::UserMessage { text, notification }) => {
                             trace!("puzzle", "easement", "user_message", "text": text);
                             let turn_id = active_turn_id.as_deref().unwrap_or("");
                             let item_id = uuid::Uuid::new_v4().to_string();
+                            let item = if notification {
+                                serde_json::json!({
+                                    "type": "agentMessage",
+                                    "id": item_id,
+                                    "text": format!("**notification**: {}", text),
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "type": "userMessage",
+                                    "id": item_id,
+                                    "content": [{
+                                        "type": "text",
+                                        "text": text,
+                                    }],
+                                })
+                            };
                             let notif = serde_json::json!({
                                 "method": "item/completed",
                                 "params": {
                                     "threadId": thread_id,
                                     "turnId": turn_id,
                                     "completedAtMs": chrono::Utc::now().timestamp_millis(),
-                                    "item": {
-                                        "type": "userMessage",
-                                        "id": item_id,
-                                        "content": [{
-                                            "type": "text",
-                                            "text": text,
-                                        }],
-                                    },
+                                    "item": item,
                                 },
                             });
                             send_tui(&mut tui_sink, notif).await;
