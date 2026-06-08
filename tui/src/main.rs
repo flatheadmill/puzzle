@@ -2,12 +2,9 @@
 // Modeled after codex-rs/tui/src/main.rs. Uses arg0_dispatch_or_else for runtime setup.
 // CODEX_HOME and the socket path are passed by Puzzle at spawn time.
 
-use codex_arg0::arg0_dispatch_or_else;
-use codex_arg0::Arg0DispatchPaths;
+use codex_arg0::{arg0_dispatch_or_else, Arg0DispatchPaths};
 use codex_config::LoaderOverrides;
-use codex_tui::run_main;
-use codex_tui::Cli;
-use codex_tui::ExitReason;
+use codex_tui::{run_main, Cli, ExitReason};
 
 fn main() -> anyhow::Result<()> {
     let socket_path = std::env::args().nth(1).unwrap_or_else(|| {

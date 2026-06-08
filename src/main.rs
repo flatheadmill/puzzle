@@ -502,8 +502,9 @@ fn token_usage_notification(thread_id: &str, turn_id: &str, sample: &UsageSample
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn usage_prefers_iteration_context_over_cumulative_top_level_cache() {
