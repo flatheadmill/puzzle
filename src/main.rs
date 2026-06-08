@@ -193,6 +193,11 @@ enum TurnOutbound {
         message: String,
         expected_turn_id: String,
     },
+    Interrupt {
+        slug: String,
+        transcript: String,
+        turn_id: Option<String>,
+    },
 }
 
 #[derive(serde::Serialize)]
@@ -1015,9 +1020,7 @@ async fn main() -> Result<()> {
                             ..
                         } => EasementEvent::TurnCompleted { turn_id, status },
                         Inbound::UserMessage {
-                            text,
-                            notification,
-                            ..
+                            text, notification, ..
                         } => EasementEvent::UserMessage { text, notification },
                         Inbound::ToolResult {
                             tool_use_id,
@@ -1337,8 +1340,12 @@ async fn main() -> Result<()> {
                                     serde_json::json!({ "turnId": expected_turn_id })
                                 }
                                 "turn/interrupt" => {
-                                    trace!("puzzle", "tui", "turn_interrupt");
-                                    // TODO: send interrupt to Easement
+                                    trace!("puzzle", "tui", "turn_interrupt", "turn_id": active_turn_id);
+                                    send_outbound(&easement_tx, Outbound::Turn(TurnOutbound::Interrupt {
+                                        slug: slug_owned.clone(),
+                                        transcript: transcript_id.clone(),
+                                        turn_id: active_turn_id.clone(),
+                                    }));
                                     serde_json::json!({})
                                 }
                                 "thread/shellCommand" => {
