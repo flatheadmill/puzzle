@@ -7,6 +7,8 @@
 // mod translate;
 // mod easement;
 
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -309,6 +311,145 @@ fn tool_args<'a>(name: &str, input: &'a Value) -> &'a Value {
     } else {
         input
     }
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct ToolKey {
+    index: i64,
+    tool_use_id: String,
+}
+
+struct ToolRun {
+    index: i64,
+    tool_use_id: String,
+    name: String,
+    input_json: String,
+    command: Option<String>,
+    started: bool,
+}
+
+struct ToolRunResult {
+    output: String,
+    is_error: bool,
+    complete: bool,
+}
+
+async fn send_tui(
+    tui_sink: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
+        tokio_tungstenite::tungstenite::Message,
+    >,
+    notif: Value,
+) {
+    let _ = futures_util::SinkExt::send(
+        tui_sink,
+        tokio_tungstenite::tungstenite::Message::text(notif.to_string()),
+    ).await;
+}
+
+fn pump_tool_runs(
+    thread_id: &str,
+    turn_id: &str,
+    cwd: &str,
+    tool_heap: &mut BinaryHeap<Reverse<ToolKey>>,
+    tool_runs: &mut HashMap<String, ToolRun>,
+    tool_results: &mut HashMap<String, ToolRunResult>,
+) -> Vec<Value> {
+    let mut notifications = Vec::new();
+
+    loop {
+        let Some(Reverse(key)) = tool_heap.peek().cloned() else {
+            break;
+        };
+
+        let Some(tool) = tool_runs.get_mut(&key.tool_use_id) else {
+            tool_heap.pop();
+            continue;
+        };
+
+        if tool.index != key.index {
+            tool_heap.pop();
+            continue;
+        }
+
+        if !tool.started {
+            let Some(command) = tool.command.as_deref() else {
+                break;
+            };
+            let notif = serde_json::json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "startedAtMs": chrono::Utc::now().timestamp_millis(),
+                    "item": {
+                        "type": "commandExecution",
+                        "id": tool.tool_use_id,
+                        "command": command,
+                        "cwd": cwd,
+                        "source": "agent",
+                        "status": "inProgress",
+                        "commandActions": [],
+                        "aggregatedOutput": null,
+                        "exitCode": null,
+                        "durationMs": null
+                    }
+                }
+            });
+            notifications.push(notif);
+            tool.started = true;
+        }
+
+        let Some(result) = tool_results.get(&key.tool_use_id) else {
+            break;
+        };
+        if !result.complete {
+            break;
+        }
+
+        tool_heap.pop();
+        let tool = tool_runs.remove(&key.tool_use_id).expect("peeked tool missing");
+        let result = tool_results.remove(&key.tool_use_id).expect("peeked result missing");
+        let command = tool.command.unwrap_or_default();
+
+        if !result.output.is_empty() {
+            let notif = serde_json::json!({
+                "method": "item/commandExecution/outputDelta",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "itemId": tool.tool_use_id,
+                    "delta": result.output
+                }
+            });
+            notifications.push(notif);
+        }
+
+        let status = if result.is_error { "failed" } else { "completed" };
+        let notif = serde_json::json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                "item": {
+                    "type": "commandExecution",
+                    "id": tool.tool_use_id,
+                    "command": command,
+                    "cwd": cwd,
+                    "source": "agent",
+                    "status": status,
+                    "commandActions": [],
+                    "aggregatedOutput": result.output,
+                    "exitCode": if result.is_error { 1 } else { 0 },
+                    "durationMs": null
+                }
+            }
+        });
+        notifications.push(notif);
+    }
+
+    notifications
 }
 
 fn is_interrupt_marker(entry: &Value) -> bool {
@@ -662,11 +803,11 @@ async fn main() -> Result<()> {
         let mut active_turn_id: Option<String> = None;
         let mut active_item_id: Option<String> = None;
         let mut active_reasoning_item_id: Option<String> = None;
-        let mut active_tool_name: Option<String> = None;
-        let mut active_tool_use_id: Option<String> = None;
         let mut in_thinking = false;
-        let mut in_tool_use = false;
-        let mut tool_input_json = String::new();
+        let mut tool_heap: BinaryHeap<Reverse<ToolKey>> = BinaryHeap::new();
+        let mut tool_runs: HashMap<String, ToolRun> = HashMap::new();
+        let mut tool_results: HashMap<String, ToolRunResult> = HashMap::new();
+        let mut tool_id_by_index: HashMap<i64, String> = HashMap::new();
         let mut last_stop_reason: Option<String> = None;
         let mut pending_turn_start_response: Option<Value> = None;
         let mut pending_turn_start_message: Option<String> = None;
@@ -934,6 +1075,7 @@ async fn main() -> Result<()> {
                                 let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
                                 match delta_type {
                                     "content_block_start" => {
+                                        let block_index = delta.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
                                         let block = delta.get("content_block").unwrap_or(&Value::Null);
                                         let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -966,16 +1108,24 @@ async fn main() -> Result<()> {
                                             let _ = futures_util::SinkExt::send(&mut tui_sink,
                                                 tokio_tungstenite::tungstenite::Message::text(header.to_string())).await;
                                         } else if block_type == "tool_use" {
-                                            in_tool_use = true;
-                                            tool_input_json.clear();
-                                            active_tool_name = Some(
-                                                block.get("name").and_then(|v| v.as_str())
-                                                    .expect("missing tool name").to_string()
-                                            );
-                                            active_tool_use_id = Some(
-                                                block.get("id").and_then(|v| v.as_str())
-                                                    .expect("missing tool_use id").to_string()
-                                            );
+                                            let tool_name = block.get("name").and_then(|v| v.as_str())
+                                                .expect("missing tool name").to_string();
+                                            let tool_use_id = block.get("id").and_then(|v| v.as_str())
+                                                .expect("missing tool_use id").to_string();
+                                            trace!("puzzle", "claude", "tool_start", "index": block_index, "tool_use_id": tool_use_id, "name": tool_name);
+                                            tool_id_by_index.insert(block_index, tool_use_id.clone());
+                                            tool_heap.push(Reverse(ToolKey {
+                                                index: block_index,
+                                                tool_use_id: tool_use_id.clone(),
+                                            }));
+                                            tool_runs.insert(tool_use_id.clone(), ToolRun {
+                                                index: block_index,
+                                                tool_use_id,
+                                                name: tool_name,
+                                                input_json: String::new(),
+                                                command: None,
+                                                started: false,
+                                            });
                                         } else if block_type == "text" {
                                             if let Some(ref item_id) = active_item_id {
                                                 let notif = serde_json::json!({
@@ -993,6 +1143,7 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     "content_block_delta" => {
+                                        let block_index = delta.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
                                         let inner = delta.get("delta").unwrap_or(&Value::Null);
                                         let inner_type = inner.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -1012,11 +1163,15 @@ async fn main() -> Result<()> {
                                                 let _ = futures_util::SinkExt::send(&mut tui_sink,
                                                     tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
                                             }
-                                        } else if in_tool_use && inner_type == "input_json_delta" {
+                                        } else if inner_type == "input_json_delta" {
                                             if let Some(partial) = inner.get("partial_json").and_then(|v| v.as_str()) {
-                                                tool_input_json.push_str(partial);
+                                                if let Some(tool_use_id) = tool_id_by_index.get(&block_index) {
+                                                    if let Some(tool) = tool_runs.get_mut(tool_use_id) {
+                                                        tool.input_json.push_str(partial);
+                                                    }
+                                                }
                                             }
-                                        } else if !in_tool_use && !in_thinking && inner_type == "text_delta" {
+                                        } else if !in_thinking && inner_type == "text_delta" {
                                             let text = inner.get("text").and_then(|v| v.as_str()).unwrap_or("");
                                             if !text.is_empty() {
                                                 if let Some(ref item_id) = active_item_id {
@@ -1036,6 +1191,7 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     "content_block_stop" => {
+                                        let block_index = delta.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
                                         if in_thinking {
                                             if let Some(reasoning_id) = active_reasoning_item_id.take() {
                                                 let notif = serde_json::json!({
@@ -1051,40 +1207,28 @@ async fn main() -> Result<()> {
                                                     tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
                                             }
                                             in_thinking = false;
-                                        } else if in_tool_use {
-                                            if let Some(ref tool_item_id) = active_tool_use_id {
-                                                let tool_name = active_tool_name.as_deref().expect("missing");
-                                                let parsed_input = serde_json::from_str::<Value>(&tool_input_json).unwrap_or_default();
-                                                let f = tool_function(tool_name, &parsed_input).unwrap_or_default();
-                                                let args = tool_args(tool_name, &parsed_input);
+                                        } else if let Some(tool_use_id) = tool_id_by_index.remove(&block_index) {
+                                            if let Some(tool) = tool_runs.get_mut(&tool_use_id) {
+                                                let parsed_input = serde_json::from_str::<Value>(&tool.input_json).unwrap_or_default();
+                                                let f = tool_function(&tool.name, &parsed_input).unwrap_or_default();
+                                                let args = tool_args(&tool.name, &parsed_input);
                                                 let command = args.get("command")
                                                     .and_then(|v| v.as_str())
-                                                    .unwrap_or(&f);
-
-                                                let notif = serde_json::json!({
-                                                    "method": "item/started",
-                                                    "params": {
-                                                        "threadId": thread_id,
-                                                        "turnId": turn_id,
-                                                        "startedAtMs": chrono::Utc::now().timestamp_millis(),
-                                                        "item": {
-                                                            "type": "commandExecution",
-                                                            "id": tool_item_id,
-                                                            "command": command,
-                                                            "cwd": cwd,
-                                                            "source": "agent",
-                                                            "status": "inProgress",
-                                                            "commandActions": [],
-                                                            "aggregatedOutput": null,
-                                                            "exitCode": null,
-                                                            "durationMs": null
-                                                        }
-                                                    }
-                                                });
-                                                let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                                    tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                                    .unwrap_or(&f)
+                                                    .to_string();
+                                                trace!("puzzle", "claude", "tool_ready", "index": block_index, "tool_use_id": tool_use_id, "command": command);
+                                                tool.command = Some(command);
                                             }
-                                            in_tool_use = false;
+                                            for notif in pump_tool_runs(
+                                                &thread_id,
+                                                turn_id,
+                                                &cwd,
+                                                &mut tool_heap,
+                                                &mut tool_runs,
+                                                &mut tool_results,
+                                            ) {
+                                                send_tui(&mut tui_sink, notif).await;
+                                            }
                                         }
                                     }
                                     "message_delta" => {
@@ -1149,7 +1293,6 @@ async fn main() -> Result<()> {
 
                                             active_turn_id = None;
                                             active_item_id = None;
-                                            active_tool_name = None;
                                         }
                                     }
                                     _ => {}
@@ -1160,7 +1303,12 @@ async fn main() -> Result<()> {
                             trace!("puzzle", "easement", "turn_completed", "turn_id": turn_id, "status": status);
                             if status == "interrupted" || status == "failed" {
                                 if let Some(turn_id_done) = active_turn_id.take() {
-                                    if let Some(tool_id) = active_tool_use_id.take() {
+                                    let tool_ids: Vec<String> = tool_runs.iter()
+                                        .filter_map(|(tool_id, tool)| if tool.started { Some(tool_id.clone()) } else { None })
+                                        .collect();
+                                    for tool_id in tool_ids {
+                                        let tool = tool_runs.remove(&tool_id).expect("started tool missing");
+                                        let command = tool.command.unwrap_or_default();
                                         let notif = serde_json::json!({
                                             "method": "item/completed",
                                             "params": {
@@ -1170,7 +1318,7 @@ async fn main() -> Result<()> {
                                                 "item": {
                                                     "type": "commandExecution",
                                                     "id": tool_id,
-                                                    "command": "", "cwd": cwd, "source": "agent",
+                                                    "command": command, "cwd": cwd, "source": "agent",
                                                     "status": status, "commandActions": [],
                                                     "aggregatedOutput": null, "exitCode": null, "durationMs": null
                                                 }
@@ -1208,11 +1356,12 @@ async fn main() -> Result<()> {
                                     let _ = futures_util::SinkExt::send(&mut tui_sink,
                                         tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
                                     active_item_id = None;
-                                    active_tool_name = None;
                                     active_reasoning_item_id = None;
-                                    in_tool_use = false;
                                     in_thinking = false;
-                                    tool_input_json.clear();
+                                    tool_heap.clear();
+                                    tool_runs.clear();
+                                    tool_results.clear();
+                                    tool_id_by_index.clear();
                                     last_stop_reason = None;
                                 }
                             }
@@ -1220,42 +1369,21 @@ async fn main() -> Result<()> {
                         Some(EasementEvent::ToolResult { tool_use_id, output, is_error }) => {
                             trace!("puzzle", "easement", "tool_result", "tool_use_id": tool_use_id, "is_error": is_error);
                             let turn_id = active_turn_id.as_deref().unwrap_or("");
-                            if !output.is_empty() {
-                                let notif = serde_json::json!({
-                                    "method": "item/commandExecution/outputDelta",
-                                    "params": {
-                                        "threadId": thread_id,
-                                        "turnId": turn_id,
-                                        "itemId": tool_use_id,
-                                        "delta": output
-                                    }
-                                });
-                                let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                    tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
-                            }
-                            let status = if is_error { "failed" } else { "completed" };
-                            let notif = serde_json::json!({
-                                "method": "item/completed",
-                                "params": {
-                                    "threadId": thread_id,
-                                    "turnId": turn_id,
-                                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
-                                    "item": {
-                                        "type": "commandExecution",
-                                        "id": tool_use_id,
-                                        "command": "",
-                                        "cwd": cwd,
-                                        "source": "agent",
-                                        "status": status,
-                                        "commandActions": [],
-                                        "aggregatedOutput": output,
-                                        "exitCode": if is_error { 1 } else { 0 },
-                                        "durationMs": null
-                                    }
-                                }
+                            tool_results.insert(tool_use_id, ToolRunResult {
+                                output,
+                                is_error,
+                                complete: true,
                             });
-                            let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                            for notif in pump_tool_runs(
+                                &thread_id,
+                                turn_id,
+                                &cwd,
+                                &mut tool_heap,
+                                &mut tool_runs,
+                                &mut tool_results,
+                            ) {
+                                send_tui(&mut tui_sink, notif).await;
+                            }
                         }
                         Some(EasementEvent::Usage(usage)) => {
                             trace!("puzzle", "easement", "usage");
