@@ -8,7 +8,7 @@
 // mod easement;
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -332,6 +332,79 @@ struct ToolRunResult {
     output: String,
     is_error: bool,
     complete: bool,
+}
+
+const MODEL_CONTEXT_WINDOW: i64 = 1_000_000;
+const USAGE_SMOOTHING_SAMPLES: usize = 3;
+
+#[derive(Clone, Debug)]
+struct UsageSample {
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    output_tokens: i64,
+    context_size: i64,
+}
+
+fn usage_i64(value: &Value, key: &str) -> i64 {
+    value.get(key).and_then(|v| v.as_i64()).unwrap_or(0).max(0)
+}
+
+fn usage_sample_from_value(value: &Value) -> UsageSample {
+    let input_tokens = usage_i64(value, "input_tokens");
+    let cached_input_tokens = usage_i64(value, "cache_read_input_tokens");
+    let output_tokens = usage_i64(value, "output_tokens");
+    UsageSample {
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+        context_size: input_tokens + cached_input_tokens,
+    }
+}
+
+fn parse_usage_sample(usage: &Value) -> Option<UsageSample> {
+    let mut samples = vec![usage_sample_from_value(usage)];
+    if let Some(iterations) = usage.get("iterations").and_then(|v| v.as_array()) {
+        samples.extend(iterations.iter().map(usage_sample_from_value));
+    }
+    samples.into_iter().max_by_key(|sample| sample.context_size)
+}
+
+fn push_usage_sample(samples: &mut VecDeque<UsageSample>, sample: UsageSample) {
+    samples.push_back(sample);
+    while samples.len() > USAGE_SMOOTHING_SAMPLES {
+        samples.pop_front();
+    }
+}
+
+fn displayed_usage_sample(samples: &VecDeque<UsageSample>) -> Option<UsageSample> {
+    samples.iter().cloned().max_by_key(|sample| sample.context_size)
+}
+
+fn token_usage_notification(thread_id: &str, turn_id: &str, sample: &UsageSample) -> Value {
+    serde_json::json!({
+        "method": "thread/tokenUsage/updated",
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "tokenUsage": {
+                "total": {
+                    "totalTokens": sample.context_size,
+                    "inputTokens": sample.context_size,
+                    "cachedInputTokens": sample.cached_input_tokens,
+                    "outputTokens": sample.output_tokens,
+                    "reasoningOutputTokens": 0
+                },
+                "last": {
+                    "totalTokens": sample.context_size,
+                    "inputTokens": sample.context_size,
+                    "cachedInputTokens": sample.cached_input_tokens,
+                    "outputTokens": sample.output_tokens,
+                    "reasoningOutputTokens": 0
+                },
+                "modelContextWindow": MODEL_CONTEXT_WINDOW
+            }
+        }
+    })
 }
 
 async fn send_tui(
@@ -719,6 +792,7 @@ async fn main() -> Result<()> {
     let mut history: Vec<serde_json::Value> = vec![];
     let mut transcript_id = String::new();
     let mut last_uuid: Option<String> = None;
+    let mut initial_usage_samples: VecDeque<UsageSample> = VecDeque::new();
 
     loop {
         match tokio::time::timeout(
@@ -739,6 +813,18 @@ async fn main() -> Result<()> {
                 history.push(entry);
                 if done {
                     break;
+                }
+            }
+            Ok(Some(EasementEvent::Usage(usage))) => {
+                if let Some(sample) = parse_usage_sample(&usage) {
+                    trace!(
+                        "puzzle", "history", "usage",
+                        "context_size": sample.context_size,
+                        "input_tokens": sample.input_tokens,
+                        "cached_input_tokens": sample.cached_input_tokens,
+                        "output_tokens": sample.output_tokens,
+                    );
+                    push_usage_sample(&mut initial_usage_samples, sample);
                 }
             }
             Ok(Some(_)) => {}
@@ -811,6 +897,7 @@ async fn main() -> Result<()> {
         let mut last_stop_reason: Option<String> = None;
         let mut pending_turn_start_response: Option<Value> = None;
         let mut pending_turn_start_message: Option<String> = None;
+        let mut usage_samples = initial_usage_samples;
 
         loop {
             tokio::select! {
@@ -832,6 +919,7 @@ async fn main() -> Result<()> {
                             let method = raw.get("method").and_then(|v| v.as_str()).unwrap_or("");
                             wire!("puzzle", "tui", "request", "method": method, "id": id);
 
+                            let mut send_initial_usage = false;
                             let result: Value = match method {
                                 "initialize" => {
                                     serde_json::json!({
@@ -869,6 +957,7 @@ async fn main() -> Result<()> {
                                 "thread/start" | "thread/resume" => {
                                     let turns = build_turns_from_entries(&history, &cwd);
                                     trace!("puzzle", "tui", "thread_start", "turns": turns.len());
+                                    send_initial_usage = true;
                                     serde_json::json!({
                                         "thread": {
                                             "id": thread_id,
@@ -1011,6 +1100,20 @@ async fn main() -> Result<()> {
                             if let Ok(json) = serde_json::to_string(&resp) {
                                 let _ = futures_util::SinkExt::send(&mut tui_sink,
                                     tokio_tungstenite::tungstenite::Message::text(json)).await;
+                            }
+                            if send_initial_usage {
+                                if let Some(sample) = displayed_usage_sample(&usage_samples) {
+                                    let turn_id = active_turn_id.as_deref().unwrap_or("");
+                                    trace!(
+                                        "puzzle", "tui", "initial_usage",
+                                        "context_size": sample.context_size,
+                                        "turn_id": turn_id,
+                                    );
+                                    send_tui(
+                                        &mut tui_sink,
+                                        token_usage_notification(&thread_id, turn_id, &sample),
+                                    ).await;
+                                }
                             }
                         }
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
@@ -1386,7 +1489,41 @@ async fn main() -> Result<()> {
                             }
                         }
                         Some(EasementEvent::Usage(usage)) => {
-                            trace!("puzzle", "easement", "usage");
+                            let Some(sample) = parse_usage_sample(&usage) else {
+                                dump!("puzzle", "easement", "usage_unparsed", "usage": usage);
+                                continue;
+                            };
+                            let previous_display = displayed_usage_sample(&usage_samples);
+                            push_usage_sample(&mut usage_samples, sample.clone());
+                            let display = displayed_usage_sample(&usage_samples).unwrap_or_else(|| sample.clone());
+                            trace!(
+                                "puzzle", "easement", "usage",
+                                "candidate_context": sample.context_size,
+                                "display_context": display.context_size,
+                                "input_tokens": sample.input_tokens,
+                                "cached_input_tokens": sample.cached_input_tokens,
+                                "output_tokens": sample.output_tokens,
+                            );
+                            if let Some(previous) = previous_display {
+                                let suppressed_large_drop = sample.context_size < previous.context_size / 2
+                                    && display.context_size >= previous.context_size;
+                                if suppressed_large_drop {
+                                    dump!(
+                                        "puzzle", "easement", "usage_drop_suppressed",
+                                        "candidate_context": sample.context_size,
+                                        "previous_display_context": previous.context_size,
+                                        "display_context": display.context_size,
+                                        "turn_id": active_turn_id.as_deref().unwrap_or(""),
+                                        "transcript": transcript_id,
+                                        "usage": usage,
+                                    );
+                                }
+                            }
+                            let turn_id = active_turn_id.as_deref().unwrap_or("");
+                            send_tui(
+                                &mut tui_sink,
+                                token_usage_notification(&thread_id, turn_id, &display),
+                            ).await;
                         }
                         Some(EasementEvent::UserMessage { text }) => {
                             trace!("puzzle", "easement", "user_message", "text": text);
