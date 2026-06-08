@@ -2,12 +2,12 @@
 // Modeled after codex-rs/tui/src/main.rs. Uses arg0_dispatch_or_else for runtime setup.
 // CODEX_HOME and the socket path are passed by Puzzle at spawn time.
 
-use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
+use codex_arg0::Arg0DispatchPaths;
 use codex_config::LoaderOverrides;
+use codex_tui::run_main;
 use codex_tui::Cli;
 use codex_tui::ExitReason;
-use codex_tui::run_main;
 
 fn main() -> anyhow::Result<()> {
     let socket_path = std::env::args().nth(1).unwrap_or_else(|| {
@@ -17,8 +17,8 @@ fn main() -> anyhow::Result<()> {
 
     arg0_dispatch_or_else(|arg0_paths: Arg0DispatchPaths| async move {
         let socket_uri = format!("unix://{}", socket_path);
-        let remote_endpoint = codex_tui::resolve_remote_addr(&socket_uri)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let remote_endpoint =
+            codex_tui::resolve_remote_addr(&socket_uri).map_err(|e| anyhow::anyhow!("{}", e))?;
 
         let cli = <Cli as clap::Parser>::parse_from::<Vec<String>, String>(vec![]);
 

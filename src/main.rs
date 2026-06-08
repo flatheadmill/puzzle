@@ -52,7 +52,11 @@ enum ThreadItem {
     #[serde(rename_all = "camelCase")]
     AgentMessage { id: String, text: String },
     #[serde(rename_all = "camelCase")]
-    Reasoning { id: String, summary: Vec<String>, content: Vec<String> },
+    Reasoning {
+        id: String,
+        summary: Vec<String>,
+        content: Vec<String>,
+    },
     #[serde(rename_all = "camelCase")]
     CommandExecution {
         id: String,
@@ -84,19 +88,55 @@ struct JsonRpcResponse {
 #[derive(serde::Deserialize)]
 #[serde(tag = "what", rename_all = "snake_case")]
 enum Inbound {
-    History { slug: String, transcript: String, #[serde(flatten)] event: HistoryInbound },
-    Delta { slug: String, transcript: String, event: Value },
-    Usage { slug: String, transcript: String, #[serde(flatten)] usage: Value },
-    Turn { slug: String, transcript: String, #[serde(flatten)] event: TurnInbound },
-    UserMessage { slug: String, transcript: String, text: String },
-    ToolResult { slug: String, transcript: String, tool_use_id: String, output: String, #[serde(default)] is_error: bool },
+    History {
+        slug: String,
+        transcript: String,
+        #[serde(flatten)]
+        event: HistoryInbound,
+    },
+    Delta {
+        slug: String,
+        transcript: String,
+        event: Value,
+    },
+    Usage {
+        slug: String,
+        transcript: String,
+        #[serde(flatten)]
+        usage: Value,
+    },
+    Turn {
+        slug: String,
+        transcript: String,
+        #[serde(flatten)]
+        event: TurnInbound,
+    },
+    UserMessage {
+        slug: String,
+        transcript: String,
+        text: String,
+    },
+    ToolResult {
+        slug: String,
+        transcript: String,
+        tool_use_id: String,
+        output: String,
+        #[serde(default)]
+        is_error: bool,
+    },
 }
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "why", rename_all = "snake_case")]
 enum HistoryInbound {
-    Begin { replay_id: String, last_uuid: Option<String> },
-    Entry { replay_id: String, entry: Value },
+    Begin {
+        replay_id: String,
+        last_uuid: Option<String>,
+    },
+    Entry {
+        replay_id: String,
+        entry: Value,
+    },
 }
 
 #[derive(serde::Deserialize)]
@@ -119,39 +159,79 @@ enum Outbound {
 #[derive(serde::Serialize)]
 #[serde(tag = "why", rename_all = "snake_case")]
 enum SocketOutbound {
-    Connect { who: String, r#where: String, tools: Vec<Value> },
+    Connect {
+        who: String,
+        r#where: String,
+        tools: Vec<Value>,
+    },
 }
 
 #[derive(serde::Serialize)]
 #[serde(tag = "why", rename_all = "snake_case")]
 enum HistoryOutbound {
-    Replay { slug: String, transcript: String, replay_id: String },
+    Replay {
+        slug: String,
+        transcript: String,
+        replay_id: String,
+    },
 }
 
 #[derive(serde::Serialize)]
 #[serde(tag = "why", rename_all = "snake_case")]
 enum TurnOutbound {
-    Start { slug: String, transcript: String, turn_id: String, message: String },
-    Steer { slug: String, transcript: String, message: String, expected_turn_id: String },
+    Start {
+        slug: String,
+        transcript: String,
+        turn_id: String,
+        message: String,
+    },
+    Steer {
+        slug: String,
+        transcript: String,
+        message: String,
+        expected_turn_id: String,
+    },
 }
 
 #[derive(serde::Serialize)]
 #[serde(tag = "why", rename_all = "snake_case")]
 enum ShellOutbound {
-    Run { slug: String, transcript: String, command: String },
+    Run {
+        slug: String,
+        transcript: String,
+        command: String,
+    },
 }
 
 // Parsed events from the Easement broadcast, ready for the select loop.
 #[derive(Debug)]
 enum EasementEvent {
-    HistoryBegin { replay_id: String, last_uuid: Option<String>, transcript: String },
-    HistoryEntry { replay_id: String, entry: Value },
+    HistoryBegin {
+        replay_id: String,
+        last_uuid: Option<String>,
+        transcript: String,
+    },
+    HistoryEntry {
+        replay_id: String,
+        entry: Value,
+    },
     Delta(Value),
     Usage(Value),
-    TurnStarted { turn_id: String },
-    TurnCompleted { turn_id: String, status: String },
-    UserMessage { text: String },
-    ToolResult { tool_use_id: String, output: String, is_error: bool },
+    TurnStarted {
+        turn_id: String,
+    },
+    TurnCompleted {
+        turn_id: String,
+        status: String,
+    },
+    UserMessage {
+        text: String,
+    },
+    ToolResult {
+        tool_use_id: String,
+        output: String,
+        is_error: bool,
+    },
 }
 
 fn send_outbound(tx: &tokio::sync::mpsc::UnboundedSender<String>, msg: Outbound) {
@@ -162,7 +242,6 @@ fn send_outbound(tx: &tokio::sync::mpsc::UnboundedSender<String>, msg: Outbound)
 
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
-
 
 #[derive(Clone, Serialize)]
 struct LogMessage {
@@ -224,7 +303,6 @@ macro_rules! error {
         })
     };
 }
-
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
@@ -297,7 +375,10 @@ fn is_our_tool(name: &str) -> bool {
 
 fn tool_function(name: &str, input: &Value) -> Option<String> {
     if name == "mcp__o__call" {
-        input.get("f").and_then(|v| v.as_str()).map(|s| s.to_string())
+        input
+            .get("f")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
     } else if name.contains("wicket") {
         name.rsplit("__").next().map(|s| s.to_string())
     } else {
@@ -339,8 +420,9 @@ const USAGE_SMOOTHING_SAMPLES: usize = 3;
 
 #[derive(Clone, Debug)]
 struct UsageSample {
-    input_tokens: i64,
+    uncached_input_tokens: i64,
     cached_input_tokens: i64,
+    cache_creation_input_tokens: i64,
     output_tokens: i64,
     context_size: i64,
 }
@@ -350,23 +432,28 @@ fn usage_i64(value: &Value, key: &str) -> i64 {
 }
 
 fn usage_sample_from_value(value: &Value) -> UsageSample {
-    let input_tokens = usage_i64(value, "input_tokens");
+    let uncached_input_tokens = usage_i64(value, "input_tokens");
     let cached_input_tokens = usage_i64(value, "cache_read_input_tokens");
+    let cache_creation_input_tokens = usage_i64(value, "cache_creation_input_tokens");
     let output_tokens = usage_i64(value, "output_tokens");
     UsageSample {
-        input_tokens,
+        uncached_input_tokens,
         cached_input_tokens,
+        cache_creation_input_tokens,
         output_tokens,
-        context_size: input_tokens + cached_input_tokens,
+        context_size: uncached_input_tokens
+            + cached_input_tokens
+            + cache_creation_input_tokens
+            + output_tokens,
     }
 }
 
 fn parse_usage_sample(usage: &Value) -> Option<UsageSample> {
-    let mut samples = vec![usage_sample_from_value(usage)];
     if let Some(iterations) = usage.get("iterations").and_then(|v| v.as_array()) {
-        samples.extend(iterations.iter().map(usage_sample_from_value));
+        let samples = iterations.iter().map(usage_sample_from_value);
+        return samples.max_by_key(|sample| sample.context_size);
     }
-    samples.into_iter().max_by_key(|sample| sample.context_size)
+    Some(usage_sample_from_value(usage))
 }
 
 fn push_usage_sample(samples: &mut VecDeque<UsageSample>, sample: UsageSample) {
@@ -377,10 +464,16 @@ fn push_usage_sample(samples: &mut VecDeque<UsageSample>, sample: UsageSample) {
 }
 
 fn displayed_usage_sample(samples: &VecDeque<UsageSample>) -> Option<UsageSample> {
-    samples.iter().cloned().max_by_key(|sample| sample.context_size)
+    samples
+        .iter()
+        .cloned()
+        .max_by_key(|sample| sample.context_size)
 }
 
 fn token_usage_notification(thread_id: &str, turn_id: &str, sample: &UsageSample) -> Value {
+    let input_tokens = sample.uncached_input_tokens
+        + sample.cached_input_tokens
+        + sample.cache_creation_input_tokens;
     serde_json::json!({
         "method": "thread/tokenUsage/updated",
         "params": {
@@ -389,14 +482,14 @@ fn token_usage_notification(thread_id: &str, turn_id: &str, sample: &UsageSample
             "tokenUsage": {
                 "total": {
                     "totalTokens": sample.context_size,
-                    "inputTokens": sample.context_size,
+                    "inputTokens": input_tokens,
                     "cachedInputTokens": sample.cached_input_tokens,
                     "outputTokens": sample.output_tokens,
                     "reasoningOutputTokens": 0
                 },
                 "last": {
                     "totalTokens": sample.context_size,
-                    "inputTokens": sample.context_size,
+                    "inputTokens": input_tokens,
                     "cachedInputTokens": sample.cached_input_tokens,
                     "outputTokens": sample.output_tokens,
                     "reasoningOutputTokens": 0
@@ -405,6 +498,52 @@ fn token_usage_notification(thread_id: &str, turn_id: &str, sample: &UsageSample
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn usage_prefers_iteration_context_over_cumulative_top_level_cache() {
+        let usage = json!({
+            "input_tokens": 3,
+            "cache_creation_input_tokens": 403,
+            "cache_read_input_tokens": 3_378_745,
+            "output_tokens": 920,
+            "iterations": [{
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 403,
+                "cache_read_input_tokens": 676_934,
+                "output_tokens": 7
+            }]
+        });
+
+        let sample = parse_usage_sample(&usage).expect("usage sample");
+        assert_eq!(sample.context_size, 677_347);
+        assert_eq!(sample.cached_input_tokens, 676_934);
+        assert_eq!(sample.cache_creation_input_tokens, 403);
+        assert_eq!(sample.output_tokens, 7);
+    }
+
+    #[test]
+    fn token_usage_notification_keeps_context_and_input_fields_consistent() {
+        let sample = UsageSample {
+            uncached_input_tokens: 3,
+            cached_input_tokens: 676_934,
+            cache_creation_input_tokens: 403,
+            output_tokens: 7,
+            context_size: 677_347,
+        };
+
+        let notification = token_usage_notification("thread", "turn", &sample);
+        let total = &notification["params"]["tokenUsage"]["total"];
+        assert_eq!(total["totalTokens"], 677_347);
+        assert_eq!(total["inputTokens"], 677_340);
+        assert_eq!(total["cachedInputTokens"], 676_934);
+        assert_eq!(total["outputTokens"], 7);
+    }
 }
 
 async fn send_tui(
@@ -417,7 +556,8 @@ async fn send_tui(
     let _ = futures_util::SinkExt::send(
         tui_sink,
         tokio_tungstenite::tungstenite::Message::text(notif.to_string()),
-    ).await;
+    )
+    .await;
 }
 
 fn pump_tool_runs(
@@ -481,8 +621,12 @@ fn pump_tool_runs(
         }
 
         tool_heap.pop();
-        let tool = tool_runs.remove(&key.tool_use_id).expect("peeked tool missing");
-        let result = tool_results.remove(&key.tool_use_id).expect("peeked result missing");
+        let tool = tool_runs
+            .remove(&key.tool_use_id)
+            .expect("peeked tool missing");
+        let result = tool_results
+            .remove(&key.tool_use_id)
+            .expect("peeked result missing");
         let command = tool.command.unwrap_or_default();
 
         if !result.output.is_empty() {
@@ -498,7 +642,11 @@ fn pump_tool_runs(
             notifications.push(notif);
         }
 
-        let status = if result.is_error { "failed" } else { "completed" };
+        let status = if result.is_error {
+            "failed"
+        } else {
+            "completed"
+        };
         let notif = serde_json::json!({
             "method": "item/completed",
             "params": {
@@ -527,8 +675,11 @@ fn pump_tool_runs(
 
 fn is_interrupt_marker(entry: &Value) -> bool {
     let kind = entry.get("who").and_then(|v| v.as_str()).unwrap_or("");
-    if kind != "user" { return false; }
-    entry.get("blocks")
+    if kind != "user" {
+        return false;
+    }
+    entry
+        .get("blocks")
         .and_then(|v| v.as_array())
         .and_then(|blocks| blocks.first())
         .and_then(|b| b.get("text"))
@@ -539,15 +690,24 @@ fn is_interrupt_marker(entry: &Value) -> bool {
 
 fn is_user_text_entry(entry: &Value) -> bool {
     let kind = entry.get("who").and_then(|v| v.as_str()).unwrap_or("");
-    if kind != "user" { return false; }
-    entry.get("blocks")
+    if kind != "user" {
+        return false;
+    }
+    entry
+        .get("blocks")
         .and_then(|v| v.as_array())
-        .map(|blocks| blocks.iter().any(|b| b.get("type").and_then(|v| v.as_str()) == Some("text")))
+        .map(|blocks| {
+            blocks
+                .iter()
+                .any(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+        })
         .unwrap_or(false)
 }
 
 fn flush_turn(turns: &mut Vec<Turn>, items: &mut Vec<ThreadItem>, status: TurnStatus) {
-    if items.is_empty() { return; }
+    if items.is_empty() {
+        return;
+    }
     turns.push(Turn {
         id: uuid::Uuid::new_v4().to_string(),
         items: items.drain(..).collect(),
@@ -574,9 +734,15 @@ fn build_turns_from_entries(entries: &[Value], cwd: &str) -> Vec<Turn> {
             continue;
         }
 
-        let kind = entry.get("who").and_then(|v| v.as_str()).expect("missing who");
+        let kind = entry
+            .get("who")
+            .and_then(|v| v.as_str())
+            .expect("missing who");
         let blocks = entry.get("blocks").and_then(|v| v.as_array());
-        let entry_id = entry.get("uuid").and_then(|v| v.as_str()).expect("missing uuid");
+        let entry_id = entry
+            .get("uuid")
+            .and_then(|v| v.as_str())
+            .expect("missing uuid");
 
         if is_user_text_entry(entry) && !current_items.is_empty() {
             flush_turn(&mut turns, &mut current_items, TurnStatus::Completed);
@@ -611,7 +777,10 @@ fn build_turns_from_entries(entries: &[Value], cwd: &str) -> Vec<Turn> {
                         });
                     }
                     ("assistant", "tool_use") => {
-                        let name = block.get("name").and_then(|v| v.as_str()).expect("missing tool name");
+                        let name = block
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .expect("missing tool name");
                         if !is_our_tool(name) {
                             continue;
                         }
@@ -624,10 +793,15 @@ fn build_turns_from_entries(entries: &[Value], cwd: &str) -> Vec<Turn> {
                         if i + 1 < entries.len() {
                             let next = &entries[i + 1];
                             if next.get("who").and_then(|v| v.as_str()) == Some("user") {
-                                if let Some(next_blocks) = next.get("blocks").and_then(|v| v.as_array()) {
+                                if let Some(next_blocks) =
+                                    next.get("blocks").and_then(|v| v.as_array())
+                                {
                                     for nb in next_blocks {
-                                        if nb.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
-                                            tool_output = nb.get("content")
+                                        if nb.get("type").and_then(|v| v.as_str())
+                                            == Some("tool_result")
+                                        {
+                                            tool_output = nb
+                                                .get("content")
                                                 .and_then(|v| v.as_str())
                                                 .unwrap_or("")
                                                 .to_string();
@@ -637,7 +811,8 @@ fn build_turns_from_entries(entries: &[Value], cwd: &str) -> Vec<Turn> {
                             }
                         }
 
-                        let command = args.get("command")
+                        let command = args
+                            .get("command")
                             .and_then(|v| v.as_str())
                             .unwrap_or(&f)
                             .to_string();
@@ -648,7 +823,11 @@ fn build_turns_from_entries(entries: &[Value], cwd: &str) -> Vec<Turn> {
                             source: "agent".to_string(),
                             status: "completed".to_string(),
                             command_actions: vec![],
-                            aggregated_output: if tool_output.is_empty() { None } else { Some(tool_output) },
+                            aggregated_output: if tool_output.is_empty() {
+                                None
+                            } else {
+                                Some(tool_output)
+                            },
                             exit_code: Some(0),
                             duration_ms: None,
                         });
@@ -665,9 +844,11 @@ fn build_turns_from_entries(entries: &[Value], cwd: &str) -> Vec<Turn> {
     turns
 }
 
-
 #[derive(clap::Parser)]
-#[command(name = "puzzle", about = "Protocol translator between the Codex TUI and Easement")]
+#[command(
+    name = "puzzle",
+    about = "Protocol translator between the Codex TUI and Easement"
+)]
 struct Args {
     slug: String,
     #[arg(long)]
@@ -697,7 +878,10 @@ async fn main() -> Result<()> {
         let path = dir.join("app-server-control.sock");
         (dir, path)
     } else {
-        let dir = PathBuf::from(&home).join(".local/state/puzzle").join(&slug).join("socket");
+        let dir = PathBuf::from(&home)
+            .join(".local/state/puzzle")
+            .join(&slug)
+            .join("socket");
         let path = dir.join("puzzle.sock");
         (dir, path)
     };
@@ -714,25 +898,35 @@ async fn main() -> Result<()> {
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(6502);
     let easement_url = format!("ws://127.0.0.1:{}", port);
-    let (ws_stream, _) = tokio_tungstenite::connect_async(&easement_url).await
+    let (ws_stream, _) = tokio_tungstenite::connect_async(&easement_url)
+        .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))?;
     let (mut ws_sink, ws_reader) = futures_util::StreamExt::split(ws_stream);
 
     let (easement_tx, mut easement_outbound_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {
         while let Some(msg) = easement_outbound_rx.recv().await {
-            if futures_util::SinkExt::send(&mut ws_sink, tokio_tungstenite::tungstenite::Message::text(msg)).await.is_err() {
+            if futures_util::SinkExt::send(
+                &mut ws_sink,
+                tokio_tungstenite::tungstenite::Message::text(msg),
+            )
+            .await
+            .is_err()
+            {
                 break;
             }
         }
     });
 
     // Identify ourselves.
-    send_outbound(&easement_tx, Outbound::Socket(SocketOutbound::Connect {
-        who: "puzzle".to_string(),
-        r#where: "localhost".to_string(),
-        tools: vec![],
-    }));
+    send_outbound(
+        &easement_tx,
+        Outbound::Socket(SocketOutbound::Connect {
+            who: "puzzle".to_string(),
+            r#where: "localhost".to_string(),
+            tools: vec![],
+        }),
+    );
 
     // Reader task: parse Easement broadcasts into EasementEvents.
     let my_slug = slug.clone();
@@ -748,29 +942,71 @@ async fn main() -> Result<()> {
                         Err(_) => continue,
                     };
                     let (msg_slug, msg_transcript) = match &msg {
-                        Inbound::History { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
-                        Inbound::Delta { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
-                        Inbound::Usage { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
-                        Inbound::Turn { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
-                        Inbound::UserMessage { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
-                        Inbound::ToolResult { slug, transcript, .. } => (slug.as_str(), transcript.as_str()),
+                        Inbound::History {
+                            slug, transcript, ..
+                        } => (slug.as_str(), transcript.as_str()),
+                        Inbound::Delta {
+                            slug, transcript, ..
+                        } => (slug.as_str(), transcript.as_str()),
+                        Inbound::Usage {
+                            slug, transcript, ..
+                        } => (slug.as_str(), transcript.as_str()),
+                        Inbound::Turn {
+                            slug, transcript, ..
+                        } => (slug.as_str(), transcript.as_str()),
+                        Inbound::UserMessage {
+                            slug, transcript, ..
+                        } => (slug.as_str(), transcript.as_str()),
+                        Inbound::ToolResult {
+                            slug, transcript, ..
+                        } => (slug.as_str(), transcript.as_str()),
                     };
-                    if msg_slug != my_slug { continue; }
+                    if msg_slug != my_slug {
+                        continue;
+                    }
                     let event = match msg {
-                        Inbound::History { transcript, event: HistoryInbound::Begin { replay_id, last_uuid }, .. } => {
-                            EasementEvent::HistoryBegin { replay_id, last_uuid, transcript }
-                        }
-                        Inbound::History { event: HistoryInbound::Entry { replay_id, entry }, .. } => {
-                            EasementEvent::HistoryEntry { replay_id, entry }
-                        }
+                        Inbound::History {
+                            transcript,
+                            event:
+                                HistoryInbound::Begin {
+                                    replay_id,
+                                    last_uuid,
+                                },
+                            ..
+                        } => EasementEvent::HistoryBegin {
+                            replay_id,
+                            last_uuid,
+                            transcript,
+                        },
+                        Inbound::History {
+                            event: HistoryInbound::Entry { replay_id, entry },
+                            ..
+                        } => EasementEvent::HistoryEntry { replay_id, entry },
                         Inbound::Delta { event, .. } => EasementEvent::Delta(event),
                         Inbound::Usage { usage, .. } => EasementEvent::Usage(usage),
-                        Inbound::Turn { event: TurnInbound::Started { turn_id }, .. } => EasementEvent::TurnStarted { turn_id },
-                        Inbound::Turn { event: TurnInbound::Completed { turn_id, status }, .. } => EasementEvent::TurnCompleted { turn_id, status },
+                        Inbound::Turn {
+                            event: TurnInbound::Started { turn_id },
+                            ..
+                        } => EasementEvent::TurnStarted { turn_id },
+                        Inbound::Turn {
+                            event: TurnInbound::Completed { turn_id, status },
+                            ..
+                        } => EasementEvent::TurnCompleted { turn_id, status },
                         Inbound::UserMessage { text, .. } => EasementEvent::UserMessage { text },
-                        Inbound::ToolResult { tool_use_id, output, is_error, .. } => EasementEvent::ToolResult { tool_use_id, output, is_error },
+                        Inbound::ToolResult {
+                            tool_use_id,
+                            output,
+                            is_error,
+                            ..
+                        } => EasementEvent::ToolResult {
+                            tool_use_id,
+                            output,
+                            is_error,
+                        },
                     };
-                    if event_tx.send(event).await.is_err() { break; }
+                    if event_tx.send(event).await.is_err() {
+                        break;
+                    }
                 }
                 Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => break,
                 Err(_) => break,
@@ -783,11 +1019,14 @@ async fn main() -> Result<()> {
 
     // Request history.
     let replay_id = uuid::Uuid::new_v4().to_string();
-    send_outbound(&easement_tx, Outbound::History(HistoryOutbound::Replay {
-        slug: slug.clone(),
-        transcript: intent.to_string(),
-        replay_id: replay_id.clone(),
-    }));
+    send_outbound(
+        &easement_tx,
+        Outbound::History(HistoryOutbound::Replay {
+            slug: slug.clone(),
+            transcript: intent.to_string(),
+            replay_id: replay_id.clone(),
+        }),
+    );
 
     let mut history: Vec<serde_json::Value> = vec![];
     let mut transcript_id = String::new();
@@ -795,11 +1034,12 @@ async fn main() -> Result<()> {
     let mut initial_usage_samples: VecDeque<UsageSample> = VecDeque::new();
 
     loop {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            event_rx.recv(),
-        ).await {
-            Ok(Some(EasementEvent::HistoryBegin { replay_id: rid, last_uuid: lu, transcript })) if rid == replay_id => {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), event_rx.recv()).await {
+            Ok(Some(EasementEvent::HistoryBegin {
+                replay_id: rid,
+                last_uuid: lu,
+                transcript,
+            })) if rid == replay_id => {
                 trace!("puzzle", "history", "begin", "last_uuid": lu, "transcript": transcript, "replay_id": replay_id);
                 transcript_id = transcript;
                 // transcript pinned for this session
@@ -808,7 +1048,10 @@ async fn main() -> Result<()> {
                 }
                 last_uuid = lu;
             }
-            Ok(Some(EasementEvent::HistoryEntry { replay_id: rid, entry })) if rid == replay_id => {
+            Ok(Some(EasementEvent::HistoryEntry {
+                replay_id: rid,
+                entry,
+            })) if rid == replay_id => {
                 let done = last_uuid.as_deref() == entry.get("uuid").and_then(|v| v.as_str());
                 history.push(entry);
                 if done {
@@ -820,8 +1063,9 @@ async fn main() -> Result<()> {
                     trace!(
                         "puzzle", "history", "usage",
                         "context_size": sample.context_size,
-                        "input_tokens": sample.input_tokens,
+                        "uncached_input_tokens": sample.uncached_input_tokens,
                         "cached_input_tokens": sample.cached_input_tokens,
+                        "cache_creation_input_tokens": sample.cache_creation_input_tokens,
                         "output_tokens": sample.output_tokens,
                     );
                     push_usage_sample(&mut initial_usage_samples, sample);
@@ -1500,8 +1744,9 @@ async fn main() -> Result<()> {
                                 "puzzle", "easement", "usage",
                                 "candidate_context": sample.context_size,
                                 "display_context": display.context_size,
-                                "input_tokens": sample.input_tokens,
+                                "uncached_input_tokens": sample.uncached_input_tokens,
                                 "cached_input_tokens": sample.cached_input_tokens,
+                                "cache_creation_input_tokens": sample.cache_creation_input_tokens,
                                 "output_tokens": sample.output_tokens,
                             );
                             if let Some(previous) = previous_display {
