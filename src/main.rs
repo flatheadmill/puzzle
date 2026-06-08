@@ -126,6 +126,13 @@ enum Inbound {
         #[serde(default)]
         is_error: bool,
     },
+    Approval {
+        slug: String,
+        transcript: String,
+        call_id: String,
+        tool_name: String,
+        input: Value,
+    },
 }
 
 #[derive(serde::Deserialize)]
@@ -156,6 +163,19 @@ enum Outbound {
     History(HistoryOutbound),
     Turn(TurnOutbound),
     Shell(ShellOutbound),
+    Approval(ApprovalOutbound),
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "why", rename_all = "snake_case")]
+enum ApprovalOutbound {
+    Response {
+        slug: String,
+        transcript: String,
+        call_id: String,
+        behavior: String,
+        message: Option<String>,
+    },
 }
 
 #[derive(serde::Serialize)]
@@ -239,6 +259,13 @@ enum EasementEvent {
         tool_use_id: String,
         output: String,
         is_error: bool,
+    },
+    Approval {
+        slug: String,
+        transcript: String,
+        call_id: String,
+        tool_name: String,
+        input: Value,
     },
 }
 
@@ -987,6 +1014,9 @@ async fn main() -> Result<()> {
                         Inbound::ToolResult {
                             slug, transcript, ..
                         } => (slug.as_str(), transcript.as_str()),
+                        Inbound::Approval {
+                            slug, transcript, ..
+                        } => (slug.as_str(), transcript.as_str()),
                     };
                     if msg_slug != my_slug {
                         continue;
@@ -1031,6 +1061,19 @@ async fn main() -> Result<()> {
                             tool_use_id,
                             output,
                             is_error,
+                        },
+                        Inbound::Approval {
+                            slug,
+                            transcript,
+                            call_id,
+                            tool_name,
+                            input,
+                        } => EasementEvent::Approval {
+                            slug,
+                            transcript,
+                            call_id,
+                            tool_name,
+                            input,
                         },
                     };
                     if event_tx.send(event).await.is_err() {
@@ -1171,6 +1214,8 @@ async fn main() -> Result<()> {
         let mut pending_turn_start_response: Option<Value> = None;
         let mut pending_turn_start_message: Option<String> = None;
         let mut usage_samples = initial_usage_samples;
+        let mut pending_approval: Option<(Value, String, String, String)> = None;
+        let mut next_server_request_id: i64 = 1000;
 
         loop {
             tokio::select! {
@@ -1189,6 +1234,47 @@ async fn main() -> Result<()> {
                             }
 
                             let id = raw.get("id").cloned().unwrap_or(Value::Null);
+                            if raw.get("method").is_none() && raw.get("result").is_some() {
+                                if let Some((pending_id, pending_slug, pending_transcript, pending_call_id)) = pending_approval.take() {
+                                    if id == pending_id {
+                                        let result = raw.get("result").cloned().unwrap_or_default();
+                                        let decision = result
+                                            .get("decision")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("decline");
+                                        let allow = matches!(
+                                            decision,
+                                            "accept"
+                                                | "acceptForSession"
+                                                | "acceptWithExecpolicyAmendment"
+                                        );
+                                        trace!("puzzle", "tui", "approval_response", "call_id": pending_call_id, "decision": decision, "allow": allow);
+                                        send_outbound(
+                                            &easement_tx,
+                                            Outbound::Approval(ApprovalOutbound::Response {
+                                                slug: pending_slug,
+                                                transcript: pending_transcript,
+                                                call_id: pending_call_id,
+                                                behavior: if allow { "allow" } else { "deny" }
+                                                    .to_string(),
+                                                message: if allow {
+                                                    None
+                                                } else {
+                                                    Some("User denied".to_string())
+                                                },
+                                            }),
+                                        );
+                                        continue;
+                                    }
+                                    pending_approval = Some((
+                                        pending_id,
+                                        pending_slug,
+                                        pending_transcript,
+                                        pending_call_id,
+                                    ));
+                                }
+                            }
+
                             let method = raw.get("method").and_then(|v| v.as_str()).unwrap_or("");
                             wire!("puzzle", "tui", "request", "method": method, "id": id);
 
@@ -1764,6 +1850,46 @@ async fn main() -> Result<()> {
                             ) {
                                 send_tui(&mut tui_sink, notif).await;
                             }
+                        }
+                        Some(EasementEvent::Approval {
+                            slug,
+                            transcript,
+                            call_id,
+                            tool_name,
+                            input,
+                        }) => {
+                            let command = input
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(&tool_name)
+                                .to_string();
+                            let reason = input
+                                .get("reason")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let request_id = Value::from(next_server_request_id);
+                            next_server_request_id += 1;
+                            pending_approval = Some((
+                                request_id.clone(),
+                                slug.clone(),
+                                transcript.clone(),
+                                call_id.clone(),
+                            ));
+                            let request = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "method": "item/commandExecution/requestApproval",
+                                "params": {
+                                    "threadId": thread_id,
+                                    "turnId": active_turn_id.as_deref().unwrap_or(""),
+                                    "itemId": active_item_id.as_deref().unwrap_or(""),
+                                    "startedAtMs": chrono::Utc::now().timestamp_millis(),
+                                    "command": command,
+                                    "reason": reason,
+                                },
+                            });
+                            trace!("puzzle", "easement", "approval_request", "call_id": call_id, "tool": tool_name);
+                            send_tui(&mut tui_sink, request).await;
                         }
                         Some(EasementEvent::Usage(usage)) => {
                             let Some(sample) = parse_usage_sample(&usage) else {
