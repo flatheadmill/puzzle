@@ -123,6 +123,7 @@ enum Inbound {
         transcript: String,
         tool_use_id: String,
         output: String,
+        changes: Option<Vec<Value>>,
         #[serde(default)]
         is_error: bool,
     },
@@ -258,6 +259,7 @@ enum EasementEvent {
     ToolResult {
         tool_use_id: String,
         output: String,
+        changes: Option<Vec<Value>>,
         is_error: bool,
     },
     Approval {
@@ -441,6 +443,7 @@ struct ToolRun {
     name: String,
     input_json: String,
     command: Option<String>,
+    is_apply_patch: bool,
     started: bool,
 }
 
@@ -448,6 +451,7 @@ struct ToolRunResult {
     output: String,
     is_error: bool,
     complete: bool,
+    changes: Option<Vec<Value>>,
 }
 
 const MODEL_CONTEXT_WINDOW: i64 = 1_000_000;
@@ -622,30 +626,66 @@ fn pump_tool_runs(
         }
 
         if !tool.started {
-            let Some(command) = tool.command.as_deref() else {
-                break;
-            };
-            let notif = serde_json::json!({
-                "method": "item/started",
-                "params": {
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                    "startedAtMs": chrono::Utc::now().timestamp_millis(),
-                    "item": {
-                        "type": "commandExecution",
-                        "id": tool.tool_use_id,
-                        "command": command,
-                        "cwd": cwd,
-                        "source": "agent",
-                        "status": "inProgress",
-                        "commandActions": [],
-                        "aggregatedOutput": null,
-                        "exitCode": null,
-                        "durationMs": null
-                    }
+            if tool.is_apply_patch {
+                let Some(result) = tool_results.get(&key.tool_use_id) else {
+                    break;
+                };
+                if !result.complete {
+                    break;
                 }
-            });
-            notifications.push(notif);
+                let changes = result.changes.clone().unwrap_or_default();
+                let notif = serde_json::json!({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "startedAtMs": chrono::Utc::now().timestamp_millis(),
+                        "item": {
+                            "type": "fileChange",
+                            "id": tool.tool_use_id,
+                            "changes": changes.clone(),
+                            "status": "inProgress"
+                        }
+                    }
+                });
+                notifications.push(notif);
+
+                let notif = serde_json::json!({
+                    "method": "item/fileChange/patchUpdated",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "itemId": tool.tool_use_id,
+                        "changes": changes
+                    }
+                });
+                notifications.push(notif);
+            } else {
+                let Some(command) = tool.command.as_deref() else {
+                    break;
+                };
+                let notif = serde_json::json!({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "startedAtMs": chrono::Utc::now().timestamp_millis(),
+                        "item": {
+                            "type": "commandExecution",
+                            "id": tool.tool_use_id,
+                            "command": command,
+                            "cwd": cwd,
+                            "source": "agent",
+                            "status": "inProgress",
+                            "commandActions": [],
+                            "aggregatedOutput": null,
+                            "exitCode": null,
+                            "durationMs": null
+                        }
+                    }
+                });
+                notifications.push(notif);
+            }
             tool.started = true;
         }
 
@@ -663,47 +703,68 @@ fn pump_tool_runs(
         let result = tool_results
             .remove(&key.tool_use_id)
             .expect("peeked result missing");
-        let command = tool.command.unwrap_or_default();
-
-        if !result.output.is_empty() {
-            let notif = serde_json::json!({
-                "method": "item/commandExecution/outputDelta",
-                "params": {
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                    "itemId": tool.tool_use_id,
-                    "delta": result.output
-                }
-            });
-            notifications.push(notif);
-        }
 
         let status = if result.is_error {
             "failed"
         } else {
             "completed"
         };
-        let notif = serde_json::json!({
-            "method": "item/completed",
-            "params": {
-                "threadId": thread_id,
-                "turnId": turn_id,
-                "completedAtMs": chrono::Utc::now().timestamp_millis(),
-                "item": {
-                    "type": "commandExecution",
-                    "id": tool.tool_use_id,
-                    "command": command,
-                    "cwd": cwd,
-                    "source": "agent",
-                    "status": status,
-                    "commandActions": [],
-                    "aggregatedOutput": result.output,
-                    "exitCode": if result.is_error { 1 } else { 0 },
-                    "durationMs": null
+
+        if tool.is_apply_patch {
+            let changes = result.changes.unwrap_or_default();
+            let notif = serde_json::json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                    "item": {
+                        "type": "fileChange",
+                        "id": tool.tool_use_id,
+                        "changes": changes,
+                        "status": status
+                    }
                 }
+            });
+            notifications.push(notif);
+        } else {
+            let command = tool.command.unwrap_or_default();
+
+            if !result.output.is_empty() {
+                let notif = serde_json::json!({
+                    "method": "item/commandExecution/outputDelta",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "itemId": tool.tool_use_id,
+                        "delta": result.output
+                    }
+                });
+                notifications.push(notif);
             }
-        });
-        notifications.push(notif);
+
+            let notif = serde_json::json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "completedAtMs": chrono::Utc::now().timestamp_millis(),
+                    "item": {
+                        "type": "commandExecution",
+                        "id": tool.tool_use_id,
+                        "command": command,
+                        "cwd": cwd,
+                        "source": "agent",
+                        "status": status,
+                        "commandActions": [],
+                        "aggregatedOutput": result.output,
+                        "exitCode": if result.is_error { 1 } else { 0 },
+                        "durationMs": null
+                    }
+                }
+            });
+            notifications.push(notif);
+        }
     }
 
     notifications
@@ -1055,11 +1116,13 @@ async fn main() -> Result<()> {
                         Inbound::ToolResult {
                             tool_use_id,
                             output,
+                            changes,
                             is_error,
                             ..
                         } => EasementEvent::ToolResult {
                             tool_use_id,
                             output,
+                            changes,
                             is_error,
                         },
                         Inbound::Approval {
@@ -1590,6 +1653,7 @@ async fn main() -> Result<()> {
                                                 name: tool_name,
                                                 input_json: String::new(),
                                                 command: None,
+                                                is_apply_patch: false,
                                                 started: false,
                                             });
                                         } else if block_type == "text" {
@@ -1684,6 +1748,7 @@ async fn main() -> Result<()> {
                                                     .to_string();
                                                 trace!("puzzle", "claude", "tool_ready", "index": block_index, "tool_use_id": tool_use_id, "command": command);
                                                 tool.command = Some(command);
+                                                tool.is_apply_patch = f == "apply_patch";
                                             }
                                             for notif in pump_tool_runs(
                                                 &thread_id,
@@ -1832,13 +1897,19 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
-                        Some(EasementEvent::ToolResult { tool_use_id, output, is_error }) => {
+                        Some(EasementEvent::ToolResult {
+                            tool_use_id,
+                            output,
+                            changes,
+                            is_error,
+                        }) => {
                             trace!("puzzle", "easement", "tool_result", "tool_use_id": tool_use_id, "is_error": is_error);
                             let turn_id = active_turn_id.as_deref().unwrap_or("");
                             tool_results.insert(tool_use_id, ToolRunResult {
                                 output,
                                 is_error,
                                 complete: true,
+                                changes,
                             });
                             for notif in pump_tool_runs(
                                 &thread_id,
