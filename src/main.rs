@@ -586,15 +586,19 @@ mod tests {
     }
 }
 
-type TuiTx = tokio::sync::mpsc::UnboundedSender<String>;
+type TuiTx = tokio::sync::mpsc::Sender<String>;
 
 fn send_tui(tx: &TuiTx, notif: Value) {
-    let _ = tx.send(notif.to_string());
+    if tx.try_send(notif.to_string()).is_err() {
+        panic!("TUI writer queue full — TUI is not reading");
+    }
 }
 
 fn send_tui_response(tx: &TuiTx, resp: JsonRpcResponse) {
     if let Ok(json) = serde_json::to_string(&resp) {
-        let _ = tx.send(json);
+        if tx.try_send(json).is_err() {
+            panic!("TUI writer queue full — TUI is not reading");
+        }
     }
 }
 
@@ -1259,10 +1263,9 @@ async fn main() -> Result<()> {
         };
 
         let (mut tui_sink, mut tui_stream) = futures_util::StreamExt::split(tui_ws);
-        // The TUI normally reads immediately; the socket closing is the real shutdown signal.
-        // If this queue grows without bound, that is visible process memory and the right
-        // recovery is a restart rather than adding back-pressure to the router loop.
-        let (tui_tx, mut tui_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // Bounded queue with panic-on-full. The TUI normally reads immediately.
+        // If the queue fills, the TUI is frozen and the process should exit.
+        let (tui_tx, mut tui_rx) = tokio::sync::mpsc::channel::<String>(1024);
         tokio::spawn(async move {
             while let Some(msg) = tui_rx.recv().await {
                 if futures_util::SinkExt::send(
