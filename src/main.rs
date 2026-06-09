@@ -586,18 +586,16 @@ mod tests {
     }
 }
 
-async fn send_tui(
-    tui_sink: &mut futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
-        tokio_tungstenite::tungstenite::Message,
-    >,
-    notif: Value,
-) {
-    let _ = futures_util::SinkExt::send(
-        tui_sink,
-        tokio_tungstenite::tungstenite::Message::text(notif.to_string()),
-    )
-    .await;
+type TuiTx = tokio::sync::mpsc::UnboundedSender<String>;
+
+fn send_tui(tx: &TuiTx, notif: Value) {
+    let _ = tx.send(notif.to_string());
+}
+
+fn send_tui_response(tx: &TuiTx, resp: JsonRpcResponse) {
+    if let Ok(json) = serde_json::to_string(&resp) {
+        let _ = tx.send(json);
+    }
 }
 
 fn pump_tool_runs(
@@ -1261,6 +1259,23 @@ async fn main() -> Result<()> {
         };
 
         let (mut tui_sink, mut tui_stream) = futures_util::StreamExt::split(tui_ws);
+        // The TUI normally reads immediately; the socket closing is the real shutdown signal.
+        // If this queue grows without bound, that is visible process memory and the right
+        // recovery is a restart rather than adding back-pressure to the router loop.
+        let (tui_tx, mut tui_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            while let Some(msg) = tui_rx.recv().await {
+                if futures_util::SinkExt::send(
+                    &mut tui_sink,
+                    tokio_tungstenite::tungstenite::Message::text(msg),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let thread_id = uuid::Uuid::new_v4().to_string();
         let home = std::env::var("HOME").unwrap_or_default();
         let cwd = format!("{}/pane/{}", home, slug_owned);
@@ -1523,10 +1538,7 @@ async fn main() -> Result<()> {
                             };
 
                             let resp = JsonRpcResponse { jsonrpc: "2.0", id, result };
-                            if let Ok(json) = serde_json::to_string(&resp) {
-                                let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                    tokio_tungstenite::tungstenite::Message::text(json)).await;
-                            }
+                            send_tui_response(&tui_tx, resp);
                             if send_initial_usage {
                                 if let Some(sample) = displayed_usage_sample(&usage_samples) {
                                     let turn_id = active_turn_id.as_deref().unwrap_or("");
@@ -1536,9 +1548,9 @@ async fn main() -> Result<()> {
                                         "turn_id": turn_id,
                                     );
                                     send_tui(
-                                        &mut tui_sink,
+                                        &tui_tx,
                                         token_usage_notification(&thread_id, turn_id, &sample),
-                                    ).await;
+                                    );
                                 }
                             }
                         }
@@ -1575,10 +1587,7 @@ async fn main() -> Result<()> {
                                         "completedAt": null,
                                     }
                                 })};
-                                if let Ok(json) = serde_json::to_string(&resp) {
-                                    let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                        tokio_tungstenite::tungstenite::Message::text(json)).await;
-                                }
+                                send_tui_response(&tui_tx, resp);
                             }
 
                             // Notify the TUI that the turn started.
@@ -1596,8 +1605,7 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             });
-                            let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                            send_tui(&tui_tx, notif);
                         }
                         Some(EasementEvent::Delta(delta)) => {
                             if let Some(ref turn_id) = active_turn_id {
@@ -1621,8 +1629,7 @@ async fn main() -> Result<()> {
                                                     "item": { "type": "reasoning", "id": reasoning_id, "summary": [], "content": [] }
                                                 }
                                             });
-                                            let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                                tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                            send_tui(&tui_tx, notif);
                                             // Initial header delta.
                                             let header = serde_json::json!({
                                                 "method": "item/reasoning/summaryTextDelta",
@@ -1634,8 +1641,7 @@ async fn main() -> Result<()> {
                                                     "summaryIndex": 0
                                                 }
                                             });
-                                            let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                                tokio_tungstenite::tungstenite::Message::text(header.to_string())).await;
+                                            send_tui(&tui_tx, header);
                                         } else if block_type == "tool_use" {
                                             let tool_name = block.get("name").and_then(|v| v.as_str())
                                                 .expect("missing tool name").to_string();
@@ -1667,8 +1673,7 @@ async fn main() -> Result<()> {
                                                         "item": { "type": "agentMessage", "id": item_id, "text": "" }
                                                     }
                                                 });
-                                                let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                                    tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                                send_tui(&tui_tx, notif);
                                             }
                                         }
                                     }
@@ -1690,8 +1695,7 @@ async fn main() -> Result<()> {
                                                         "summaryIndex": 0
                                                     }
                                                 });
-                                                let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                                    tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                                send_tui(&tui_tx, notif);
                                             }
                                         } else if inner_type == "input_json_delta" {
                                             if let Some(partial) = inner.get("partial_json").and_then(|v| v.as_str()) {
@@ -1714,8 +1718,7 @@ async fn main() -> Result<()> {
                                                             "delta": text
                                                         }
                                                     });
-                                                    let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                                        tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                                    send_tui(&tui_tx, notif);
                                                 }
                                             }
                                         }
@@ -1733,8 +1736,7 @@ async fn main() -> Result<()> {
                                                         "item": { "type": "reasoning", "id": reasoning_id, "summary": [], "content": [] }
                                                     }
                                                 });
-                                                let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                                    tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                                send_tui(&tui_tx, notif);
                                             }
                                             in_thinking = false;
                                         } else if let Some(tool_use_id) = tool_id_by_index.remove(&block_index) {
@@ -1758,7 +1760,7 @@ async fn main() -> Result<()> {
                                                 &mut tool_runs,
                                                 &mut tool_results,
                                             ) {
-                                                send_tui(&mut tui_sink, notif).await;
+                                                send_tui(&tui_tx, notif);
                                             }
                                         }
                                     }
@@ -1786,8 +1788,7 @@ async fn main() -> Result<()> {
                                                         "item": { "type": "agentMessage", "id": item_id, "text": "" }
                                                     }
                                                 });
-                                                let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                                    tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                                send_tui(&tui_tx, notif);
                                             }
                                             active_item_id = Some(uuid::Uuid::new_v4().to_string());
                                         } else {
@@ -1801,8 +1802,7 @@ async fn main() -> Result<()> {
                                                         "item": { "type": "agentMessage", "id": item_id, "text": "" }
                                                     }
                                                 });
-                                                let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                                    tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                                send_tui(&tui_tx, notif);
                                             }
 
                                             let notif = serde_json::json!({
@@ -1819,8 +1819,7 @@ async fn main() -> Result<()> {
                                                     }
                                                 }
                                             });
-                                            let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                                tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                            send_tui(&tui_tx, notif);
 
                                             active_turn_id = None;
                                             active_item_id = None;
@@ -1855,8 +1854,7 @@ async fn main() -> Result<()> {
                                                 }
                                             }
                                         });
-                                        let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                            tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                        send_tui(&tui_tx, notif);
                                     }
                                     if let Some(ref item_id) = active_item_id {
                                         let notif = serde_json::json!({
@@ -1868,8 +1866,7 @@ async fn main() -> Result<()> {
                                                 "item": { "type": "agentMessage", "id": item_id, "text": "" }
                                             }
                                         });
-                                        let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                            tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                        send_tui(&tui_tx, notif);
                                     }
                                     let notif = serde_json::json!({
                                         "method": "turn/completed",
@@ -1884,8 +1881,7 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                     });
-                                    let _ = futures_util::SinkExt::send(&mut tui_sink,
-                                        tokio_tungstenite::tungstenite::Message::text(notif.to_string())).await;
+                                    send_tui(&tui_tx, notif);
                                     active_item_id = None;
                                     active_reasoning_item_id = None;
                                     in_thinking = false;
@@ -1919,7 +1915,7 @@ async fn main() -> Result<()> {
                                 &mut tool_runs,
                                 &mut tool_results,
                             ) {
-                                send_tui(&mut tui_sink, notif).await;
+                                send_tui(&tui_tx, notif);
                             }
                         }
                         Some(EasementEvent::Approval {
@@ -1960,7 +1956,7 @@ async fn main() -> Result<()> {
                                 },
                             });
                             trace!("puzzle", "easement", "approval_request", "call_id": call_id, "tool": tool_name);
-                            send_tui(&mut tui_sink, request).await;
+                            send_tui(&tui_tx, request);
                         }
                         Some(EasementEvent::Usage(usage)) => {
                             let Some(sample) = parse_usage_sample(&usage) else {
@@ -1996,9 +1992,9 @@ async fn main() -> Result<()> {
                             }
                             let turn_id = active_turn_id.as_deref().unwrap_or("");
                             send_tui(
-                                &mut tui_sink,
+                                &tui_tx,
                                 token_usage_notification(&thread_id, turn_id, &display),
-                            ).await;
+                            );
                         }
                         Some(EasementEvent::UserMessage { text, notification }) => {
                             trace!("puzzle", "easement", "user_message", "text": text);
@@ -2029,7 +2025,7 @@ async fn main() -> Result<()> {
                                     "item": item,
                                 },
                             });
-                            send_tui(&mut tui_sink, notif).await;
+                            send_tui(&tui_tx, notif);
                         }
                         Some(_) => {}
                         None => {
