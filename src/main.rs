@@ -588,16 +588,30 @@ mod tests {
 
 type TuiTx = tokio::sync::mpsc::Sender<String>;
 
-fn send_tui(tx: &TuiTx, notif: Value) {
-    if tx.try_send(notif.to_string()).is_err() {
-        panic!("TUI writer queue full — TUI is not reading");
+fn send_tui_raw(tx: &TuiTx, msg: String) {
+    match tx.try_send(msg) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            eprintln!("fatal: TUI writer queue full; TUI is not reading");
+            std::process::abort();
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            eprintln!("fatal: TUI writer queue closed; TUI connection is gone");
+            std::process::abort();
+        }
     }
 }
 
+fn send_tui(tx: &TuiTx, notif: Value) {
+    send_tui_raw(tx, notif.to_string());
+}
+
 fn send_tui_response(tx: &TuiTx, resp: JsonRpcResponse) {
-    if let Ok(json) = serde_json::to_string(&resp) {
-        if tx.try_send(json).is_err() {
-            panic!("TUI writer queue full — TUI is not reading");
+    match serde_json::to_string(&resp) {
+        Ok(json) => send_tui_raw(tx, json),
+        Err(e) => {
+            eprintln!("fatal: failed to serialize TUI response: {e}");
+            std::process::abort();
         }
     }
 }
