@@ -1,4 +1,6 @@
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -11,8 +13,6 @@ use codex_app_server_client::RemoteAppServerEndpoint;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ThreadLoadedListParams;
-use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadStatus;
@@ -24,16 +24,29 @@ use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
 use futures_util::StreamExt;
 use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::prelude::Alignment;
+use ratatui::layout::Constraint;
+use ratatui::layout::Layout;
+use ratatui::style::Color;
+use ratatui::style::Style;
+use ratatui::text::Line;
+use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 
 const CLIENT_NAME: &str = "puzzle";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Clone, Debug, PartialEq)]
+struct Window {
+    slug: String,
+    preview: String,
+    status: ThreadStatus,
+    recency_at: i64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let socket_path = socket_path()?;
+    let state_root = muster_state_root()?;
+    let socket_path = socket_path(&state_root);
     let socket_path = AbsolutePathBuf::from_absolute_path(socket_path)
         .context("app-server socket path must be absolute")?;
     let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
@@ -48,75 +61,118 @@ async fn main() -> Result<()> {
     .await
     .context("connect to shared Codex app-server")?;
 
-    let count = active_root_count(&client).await?;
+    let mut request_id = 1;
+    let windows = load_windows(&client, &state_root, &mut request_id).await?;
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, client, count).await;
+    let result = run(&mut terminal, client, state_root, request_id, windows).await;
     ratatui::restore();
     result
 }
 
-fn socket_path() -> Result<PathBuf> {
-    if let Some(path) = env::args_os().nth(1) {
+fn muster_state_root() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("MUSTER_STATE_HOME") {
         return Ok(path.into());
     }
 
-    if let Some(path) = env::var_os("MUSTER_STATE_HOME") {
-        return Ok(PathBuf::from(path).join("codex/app-server.sock"));
-    }
-
     if let Some(path) = env::var_os("XDG_STATE_HOME") {
-        return Ok(PathBuf::from(path).join("muster/codex/app-server.sock"));
+        return Ok(PathBuf::from(path).join("muster"));
     }
 
     let Some(home) = env::var_os("HOME") else {
-        bail!("pass the app-server socket path or set HOME");
+        bail!("set MUSTER_STATE_HOME, XDG_STATE_HOME, or HOME");
     };
-    Ok(PathBuf::from(home).join(".local/state/muster/codex/app-server.sock"))
+    Ok(PathBuf::from(home).join(".local/state/muster"))
 }
 
-async fn active_root_count(client: &RemoteAppServerClient) -> Result<usize> {
-    let loaded: ThreadLoadedListResponse = client
-        .request_typed(ClientRequest::ThreadLoadedList {
-            request_id: RequestId::Integer(1),
-            params: ThreadLoadedListParams {
-                cursor: None,
-                limit: None,
-            },
-        })
-        .await
-        .context("list loaded Codex threads")?;
+fn socket_path(state_root: &Path) -> PathBuf {
+    if let Some(path) = env::args_os().nth(1) {
+        return path.into();
+    }
 
-    let mut count = 0;
-    for (index, thread_id) in loaded.data.into_iter().enumerate() {
+    state_root.join("codex/app-server.sock")
+}
+
+fn primary_sessions(state_root: &Path) -> Result<Vec<(String, String)>> {
+    let codex_state = state_root.join("codex");
+    let entries = fs::read_dir(&codex_state)
+        .with_context(|| format!("read Muster Codex state at {}", codex_state.display()))?;
+    let mut sessions = Vec::new();
+
+    for entry in entries {
+        let entry = entry.context("read Muster Codex state entry")?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let sid_path = entry.path().join("sid.json");
+        if !sid_path.is_file() {
+            continue;
+        }
+
+        let slug = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("window slug is not valid UTF-8"))?;
+        let encoded = fs::read_to_string(&sid_path)
+            .with_context(|| format!("read session ID at {}", sid_path.display()))?;
+        let thread_id: String = serde_json::from_str(&encoded)
+            .with_context(|| format!("decode session ID at {}", sid_path.display()))?;
+        sessions.push((slug, thread_id));
+    }
+
+    Ok(sessions)
+}
+
+async fn load_windows(
+    client: &RemoteAppServerClient,
+    state_root: &Path,
+    request_id: &mut i64,
+) -> Result<Vec<Window>> {
+    let mut windows = Vec::new();
+    for (slug, thread_id) in primary_sessions(state_root)? {
+        let id = *request_id;
+        *request_id += 1;
         let response: ThreadReadResponse = client
             .request_typed(ClientRequest::ThreadRead {
-                request_id: RequestId::Integer(index as i64 + 2),
+                request_id: RequestId::Integer(id),
                 params: ThreadReadParams {
                     thread_id,
                     include_turns: false,
                 },
             })
             .await
-            .context("read loaded Codex thread")?;
+            .with_context(|| format!("read Codex thread for window {slug}"))?;
 
-        if !response.thread.ephemeral
-            && response.thread.parent_thread_id.is_none()
-            && matches!(response.thread.status, ThreadStatus::Active { .. })
-        {
-            count += 1;
-        }
+        windows.push(Window {
+            slug,
+            preview: response.thread.preview,
+            status: response.thread.status,
+            recency_at: response
+                .thread
+                .recency_at
+                .unwrap_or(response.thread.updated_at),
+        });
     }
 
-    Ok(count)
+    windows.sort_by(|left, right| {
+        right
+            .recency_at
+            .cmp(&left.recency_at)
+            .then_with(|| left.slug.cmp(&right.slug))
+    });
+    Ok(windows)
 }
 
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     mut client: RemoteAppServerClient,
-    mut count: usize,
+    state_root: PathBuf,
+    mut request_id: i64,
+    mut windows: Vec<Window>,
 ) -> Result<()> {
     let mut terminal_events = EventStream::new();
-    terminal.draw(|frame| draw(frame, count))?;
+    let mut offset = 0;
+    terminal.draw(|frame| draw(frame, &windows, offset))?;
 
     loop {
         tokio::select! {
@@ -132,9 +188,34 @@ async fn run(
                         if quit {
                             break;
                         }
+                        let page = visible_rows(terminal.size()?.height);
+                        let maximum = windows.len().saturating_sub(page);
+                        match key.code {
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                offset = (offset + 1).min(maximum);
+                                terminal.draw(|frame| draw(frame, &windows, offset))?;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                offset = offset.saturating_sub(1);
+                                terminal.draw(|frame| draw(frame, &windows, offset))?;
+                            }
+                            KeyCode::Home | KeyCode::Char('g') => {
+                                offset = 0;
+                                terminal.draw(|frame| draw(frame, &windows, offset))?;
+                            }
+                            KeyCode::End | KeyCode::Char('G') => {
+                                offset = maximum;
+                                terminal.draw(|frame| draw(frame, &windows, offset))?;
+                            }
+                            _ => {}
+                        }
                     }
                     Event::Resize(_, _) => {
-                        terminal.draw(|frame| draw(frame, count))?;
+                        let maximum = windows
+                            .len()
+                            .saturating_sub(visible_rows(terminal.size()?.height));
+                        offset = offset.min(maximum);
+                        terminal.draw(|frame| draw(frame, &windows, offset))?;
                     }
                     _ => {}
                 }
@@ -149,10 +230,14 @@ async fn run(
                                 | ServerNotification::ThreadClosed(_)
                         ) =>
                     {
-                        let next = active_root_count(&client).await?;
-                        if next != count {
-                            count = next;
-                            terminal.draw(|frame| draw(frame, count))?;
+                        let next = load_windows(&client, &state_root, &mut request_id).await?;
+                        if next != windows {
+                            windows = next;
+                            let maximum = windows
+                                .len()
+                                .saturating_sub(visible_rows(terminal.size()?.height));
+                            offset = offset.min(maximum);
+                            terminal.draw(|frame| draw(frame, &windows, offset))?;
                         }
                     }
                     Some(AppServerEvent::Disconnected { message }) => bail!(message),
@@ -167,11 +252,66 @@ async fn run(
     Ok(())
 }
 
-fn draw(frame: &mut Frame<'_>, count: usize) {
+fn visible_rows(height: u16) -> usize {
+    usize::from(height.saturating_sub(2))
+}
+
+fn status(thread_status: &ThreadStatus) -> (&'static str, Color) {
+    match thread_status {
+        ThreadStatus::Active { .. } => ("active", Color::Green),
+        ThreadStatus::Idle => ("idle", Color::DarkGray),
+        ThreadStatus::NotLoaded => ("unloaded", Color::DarkGray),
+        ThreadStatus::SystemError => ("error", Color::Red),
+    }
+}
+
+fn preview(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn draw(frame: &mut Frame<'_>, windows: &[Window], offset: usize) {
     let area = frame.area();
-    let line = Rect::new(area.x, area.y + area.height / 2, area.width, 1);
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+
+    let title = format!("{} primary Codex windows", windows.len());
+    frame.render_widget(Paragraph::new(title), header);
+
+    let rows = windows
+        .iter()
+        .skip(offset)
+        .take(visible_rows(area.height))
+        .map(|window| {
+            let (status, color) = status(&window.status);
+            Line::from(vec![
+                Span::styled(format!("{status:<10}"), Style::default().fg(color)),
+                Span::styled(
+                    format!("{:<20}", window.slug),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(preview(&window.preview)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(rows), body);
+
+    let position = if windows.len() <= visible_rows(area.height) {
+        String::new()
+    } else {
+        format!(
+            "  {}-{} of {}",
+            offset + 1,
+            (offset + visible_rows(area.height)).min(windows.len()),
+            windows.len()
+        )
+    };
     frame.render_widget(
-        Paragraph::new(count.to_string()).alignment(Alignment::Center),
-        line,
+        Paragraph::new(format!("j/k scroll  g/G first/last  q quit{position}"))
+            .style(Style::default().fg(Color::DarkGray)),
+        footer,
     );
 }
