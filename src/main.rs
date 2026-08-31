@@ -426,14 +426,22 @@ async fn run(
                         let page = visible_rows(terminal.size()?.height);
                         match key.code {
                             KeyCode::Down | KeyCode::Char('j') => {
-                                selected = (selected + 1).min(windows.len().saturating_sub(1));
-                                offset = keep_visible(selected, offset, page);
-                                terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+                                let next = (selected + 1).min(windows.len().saturating_sub(1));
+                                if next != selected {
+                                    selected = next;
+                                    teleporter.show(&windows[selected].slug).await?;
+                                    offset = keep_visible(selected, offset, page);
+                                    terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+                                }
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
-                                selected = selected.saturating_sub(1);
-                                offset = keep_visible(selected, offset, page);
-                                terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+                                let next = selected.saturating_sub(1);
+                                if next != selected {
+                                    selected = next;
+                                    teleporter.show(&windows[selected].slug).await?;
+                                    offset = keep_visible(selected, offset, page);
+                                    terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+                                }
                             }
                             KeyCode::Home | KeyCode::Char('g') => {
                                 selected = 0;
