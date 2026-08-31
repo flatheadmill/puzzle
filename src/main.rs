@@ -171,9 +171,7 @@ async fn tagged_pane(slug: &str) -> Result<Option<String>> {
 }
 
 async fn create_client_pane(slug: &str) -> Result<String> {
-    if !slug.chars().all(|character| {
-        character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
-    }) {
+    if !valid_window_slug(slug) {
         bail!("invalid window slug: {slug}");
     }
 
@@ -207,6 +205,16 @@ async fn create_client_pane(slug: &str) -> Result<String> {
     tmux_status(["set-option", "-p", "-t", pane.as_str(), SLUG_OPTION, slug]).await?;
     tmux_status(["rename-window", "-t", pane.as_str(), slug]).await?;
     Ok(pane)
+}
+
+fn valid_window_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.split('_').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+        })
 }
 
 async fn tmux_success<const N: usize>(args: [&str; N]) -> Result<bool> {
