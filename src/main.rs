@@ -432,7 +432,11 @@ async fn run(
                         let page = visible_rows(terminal.size()?.height);
                         match key.code {
                             KeyCode::Down | KeyCode::Char('j') => {
-                                let next = (selected + 1).min(windows.len().saturating_sub(1));
+                                let next = if windows.is_empty() || selected + 1 >= windows.len() {
+                                    0
+                                } else {
+                                    selected + 1
+                                };
                                 if next != selected {
                                     selected = next;
                                     teleporter.show(&windows[selected].slug).await?;
@@ -441,7 +445,11 @@ async fn run(
                                 }
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
-                                let next = selected.saturating_sub(1);
+                                let next = if selected == 0 {
+                                    windows.len().saturating_sub(1)
+                                } else {
+                                    selected - 1
+                                };
                                 if next != selected {
                                     selected = next;
                                     teleporter.show(&windows[selected].slug).await?;
