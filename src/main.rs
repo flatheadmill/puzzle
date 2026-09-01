@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -17,9 +19,23 @@ use codex_app_server_client::RemoteAppServerEndpoint;
 use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::SortDirection;
+use codex_app_server_protocol::ThreadForkParams;
+use codex_app_server_protocol::ThreadForkResponse;
+use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadReadParams;
 use codex_app_server_protocol::ThreadReadResponse;
 use codex_app_server_protocol::ThreadStatus;
+use codex_app_server_protocol::ThreadTurnsListParams;
+use codex_app_server_protocol::ThreadTurnsListResponse;
+use codex_app_server_protocol::ThreadUnsubscribeParams;
+use codex_app_server_protocol::ThreadUnsubscribeResponse;
+use codex_app_server_protocol::TurnItemsView;
+use codex_app_server_protocol::TurnStartParams;
+use codex_app_server_protocol::TurnStartResponse;
+use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::UserInput;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use crossterm::event::Event;
 use crossterm::event::EventStream;
@@ -35,7 +51,10 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
+use serde::Deserialize;
+use serde::Serialize;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time::Duration;
 use tokio::time::sleep;
 
@@ -44,13 +63,50 @@ const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PARKING_SESSION: &str = "puzzle-parking";
 const VIEWPORT_OPTION: &str = "@puzzle-viewport-pane";
 const SLUG_OPTION: &str = "@puzzle-slug";
+const SUMMARY_MODEL: &str = "gpt-5.6-terra";
+const SUMMARY_PROMPT_VERSION: u32 = 1;
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(30);
+const SUMMARY_PROMPT: &str = "Write a plain summary of the result of the previous turn in this conversation. It must be useful for recognizing what work was taking place. If the turn was insignificant or the conversation was mostly discussion, summarize the useful subject or state instead. Use no more than 40 characters.";
 
 #[derive(Clone, Debug, PartialEq)]
 struct Window {
     slug: String,
+    thread_id: String,
+    completed_turn_id: Option<String>,
     preview: String,
+    summary: Option<String>,
+    summary_turn_id: Option<String>,
     status: ThreadStatus,
     recency_at: i64,
+}
+
+#[derive(Clone, Debug)]
+struct SummaryJob {
+    thread_id: String,
+    turn_id: String,
+}
+
+#[derive(Debug)]
+struct SummaryResult {
+    job: SummaryJob,
+    summary: Result<String, String>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct SummaryCache {
+    version: u32,
+    entries: HashMap<String, SummaryCacheEntry>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SummaryCacheEntry {
+    turn_id: String,
+    summary: String,
+}
+
+#[derive(Deserialize)]
+struct SummaryPayload {
+    summary: String,
 }
 
 struct Teleporter {
@@ -279,20 +335,23 @@ async fn main() -> Result<()> {
     let socket_path = socket_path(&state_root);
     let socket_path = AbsolutePathBuf::from_absolute_path(socket_path)
         .context("app-server socket path must be absolute")?;
-    let client = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
-        endpoint: RemoteAppServerEndpoint::UnixSocket { socket_path },
-        client_name: CLIENT_NAME.to_string(),
-        client_version: CLIENT_VERSION.to_string(),
-        experimental_api: false,
-        mcp_server_openai_form_elicitation: false,
-        opt_out_notification_methods: Vec::new(),
-        channel_capacity: 32,
-    })
-    .await
-    .context("connect to shared Codex app-server")?;
+    let client = connect_app_server(&socket_path, CLIENT_NAME, false).await?;
+    let summary_client = connect_app_server(&socket_path, "puzzle-summary", false).await?;
+
+    let cache_path = summary_cache_path()?;
+    let mut cache = load_summary_cache(&cache_path)?;
+    let (summary_jobs, summary_job_rx) = mpsc::unbounded_channel();
+    let (summary_result_tx, summary_results) = mpsc::unbounded_channel();
+    tokio::spawn(summary_worker(
+        summary_client,
+        summary_job_rx,
+        summary_result_tx,
+    ));
 
     let mut request_id = 1;
-    let windows = load_windows(&client, &state_root, &mut request_id).await?;
+    let windows = load_windows(&client, &state_root, &cache, &mut request_id).await?;
+    let mut attempted_summaries = HashSet::new();
+    schedule_summaries(&windows, &mut attempted_summaries, &summary_jobs);
     let teleporter = Teleporter::initialize().await?;
     let mut terminal = ratatui::init();
     let result = run(
@@ -302,10 +361,35 @@ async fn main() -> Result<()> {
         request_id,
         windows,
         teleporter,
+        &mut cache,
+        cache_path,
+        summary_jobs,
+        summary_results,
+        attempted_summaries,
     )
     .await;
     ratatui::restore();
     result
+}
+
+async fn connect_app_server(
+    socket_path: &AbsolutePathBuf,
+    client_name: &str,
+    experimental_api: bool,
+) -> Result<RemoteAppServerClient> {
+    RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+        endpoint: RemoteAppServerEndpoint::UnixSocket {
+            socket_path: socket_path.clone(),
+        },
+        client_name: client_name.to_string(),
+        client_version: CLIENT_VERSION.to_string(),
+        experimental_api,
+        mcp_server_openai_form_elicitation: false,
+        opt_out_notification_methods: Vec::new(),
+        channel_capacity: 32,
+    })
+    .await
+    .with_context(|| format!("connect {client_name} to shared Codex app-server"))
 }
 
 fn muster_state_root() -> Result<PathBuf> {
@@ -329,6 +413,52 @@ fn socket_path(state_root: &Path) -> PathBuf {
     }
 
     state_root.join("codex/app-server.sock")
+}
+
+fn summary_cache_path() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(path).join("puzzle/thread-summaries.json"));
+    }
+
+    let Some(home) = env::var_os("HOME") else {
+        bail!("set XDG_STATE_HOME or HOME");
+    };
+    Ok(PathBuf::from(home).join(".local/state/puzzle/thread-summaries.json"))
+}
+
+fn load_summary_cache(path: &Path) -> Result<SummaryCache> {
+    if !path.exists() {
+        return Ok(SummaryCache {
+            version: SUMMARY_PROMPT_VERSION,
+            ..SummaryCache::default()
+        });
+    }
+    let encoded = fs::read_to_string(path)
+        .with_context(|| format!("read summary cache at {}", path.display()))?;
+    let cache: SummaryCache = serde_json::from_str(&encoded)
+        .with_context(|| format!("decode summary cache at {}", path.display()))?;
+    if cache.version == SUMMARY_PROMPT_VERSION {
+        Ok(cache)
+    } else {
+        Ok(SummaryCache {
+            version: SUMMARY_PROMPT_VERSION,
+            ..SummaryCache::default()
+        })
+    }
+}
+
+fn save_summary_cache(path: &Path, cache: &SummaryCache) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("summary cache path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create Puzzle state directory at {}", parent.display()))?;
+    let staged = path.with_extension("json.new");
+    let encoded = serde_json::to_vec_pretty(cache).context("encode summary cache")?;
+    fs::write(&staged, encoded)
+        .with_context(|| format!("write staged summary cache at {}", staged.display()))?;
+    fs::rename(&staged, path)
+        .with_context(|| format!("install summary cache at {}", path.display()))
 }
 
 fn primary_sessions(state_root: &Path) -> Result<Vec<(String, String)>> {
@@ -365,6 +495,7 @@ fn primary_sessions(state_root: &Path) -> Result<Vec<(String, String)>> {
 async fn load_windows(
     client: &RemoteAppServerClient,
     state_root: &Path,
+    cache: &SummaryCache,
     request_id: &mut i64,
 ) -> Result<Vec<Window>> {
     let mut windows = Vec::new();
@@ -375,16 +506,26 @@ async fn load_windows(
             .request_typed(ClientRequest::ThreadRead {
                 request_id: RequestId::Integer(id),
                 params: ThreadReadParams {
-                    thread_id,
+                    thread_id: thread_id.clone(),
                     include_turns: false,
                 },
             })
             .await
             .with_context(|| format!("read Codex thread for window {slug}"))?;
+        let completed_turn_id = latest_completed_turn(client, &thread_id, request_id)
+            .await
+            .with_context(|| format!("read latest completed turn for window {slug}"))?;
+        let cached = cache.entries.get(&thread_id);
+        let summary = cached.map(|entry| entry.summary.clone());
+        let summary_turn_id = cached.map(|entry| entry.turn_id.clone());
 
         windows.push(Window {
             slug,
+            thread_id,
+            completed_turn_id,
             preview: response.thread.preview,
+            summary,
+            summary_turn_id,
             status: response.thread.status,
             recency_at: response
                 .thread
@@ -402,6 +543,227 @@ async fn load_windows(
     Ok(windows)
 }
 
+async fn latest_completed_turn(
+    client: &RemoteAppServerClient,
+    thread_id: &str,
+    request_id: &mut i64,
+) -> Result<Option<String>> {
+    let id = *request_id;
+    *request_id += 1;
+    let response: ThreadTurnsListResponse = client
+        .request_typed(ClientRequest::ThreadTurnsList {
+            request_id: RequestId::Integer(id),
+            params: ThreadTurnsListParams {
+                thread_id: thread_id.to_string(),
+                cursor: None,
+                limit: Some(4),
+                sort_direction: Some(SortDirection::Desc),
+                items_view: Some(TurnItemsView::NotLoaded),
+            },
+        })
+        .await
+        .context("list recent Codex turns")?;
+    Ok(response
+        .data
+        .into_iter()
+        .find(|turn| turn.status == TurnStatus::Completed)
+        .map(|turn| turn.id))
+}
+
+fn schedule_summaries(
+    windows: &[Window],
+    attempted: &mut HashSet<(String, String)>,
+    jobs: &mpsc::UnboundedSender<SummaryJob>,
+) {
+    for window in windows {
+        if window.status != ThreadStatus::Idle {
+            continue;
+        }
+        let Some(turn_id) = &window.completed_turn_id else {
+            continue;
+        };
+        if window.summary_turn_id.as_deref() == Some(turn_id) {
+            continue;
+        }
+        let key = (window.thread_id.clone(), turn_id.clone());
+        if attempted.insert(key) {
+            let _ = jobs.send(SummaryJob {
+                thread_id: window.thread_id.clone(),
+                turn_id: turn_id.clone(),
+            });
+        }
+    }
+}
+
+async fn summary_worker(
+    mut client: RemoteAppServerClient,
+    mut jobs: mpsc::UnboundedReceiver<SummaryJob>,
+    results: mpsc::UnboundedSender<SummaryResult>,
+) {
+    let mut request_id = 1;
+    while let Some(job) = jobs.recv().await {
+        let summary = generate_summary(&mut client, &job, &mut request_id)
+            .await
+            .map_err(|error| format!("{error:#}"));
+        if results.send(SummaryResult { job, summary }).is_err() {
+            break;
+        }
+    }
+    let _ = client.shutdown().await;
+}
+
+async fn generate_summary(
+    client: &mut RemoteAppServerClient,
+    job: &SummaryJob,
+    request_id: &mut i64,
+) -> Result<String> {
+    let fork_request_id = next_request_id(request_id);
+    let fork: ThreadForkResponse = tokio::time::timeout(
+        SUMMARY_TIMEOUT,
+        client.request_typed(ClientRequest::ThreadFork {
+            request_id: fork_request_id,
+            params: ThreadForkParams {
+                thread_id: job.thread_id.clone(),
+                last_turn_id: Some(job.turn_id.clone()),
+                model: Some(SUMMARY_MODEL.to_string()),
+                ephemeral: true,
+                exclude_turns: true,
+                ..ThreadForkParams::default()
+            },
+        }),
+    )
+    .await
+    .context("summary fork timed out")?
+    .context("fork source thread for summary")?;
+    let fork_id = fork.thread.id;
+
+    let summary = tokio::time::timeout(
+        SUMMARY_TIMEOUT,
+        generate_summary_in_fork(client, &fork_id, request_id),
+    )
+    .await
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("summary turn timed out")));
+    let unsubscribe_request_id = next_request_id(request_id);
+    let cleanup = tokio::time::timeout(
+        SUMMARY_TIMEOUT,
+        client.request_typed::<ThreadUnsubscribeResponse>(ClientRequest::ThreadUnsubscribe {
+            request_id: unsubscribe_request_id,
+            params: ThreadUnsubscribeParams {
+                thread_id: fork_id.clone(),
+            },
+        }),
+    )
+    .await;
+
+    let _ = cleanup;
+    summary
+}
+
+async fn generate_summary_in_fork(
+    client: &mut RemoteAppServerClient,
+    fork_id: &str,
+    request_id: &mut i64,
+) -> Result<String> {
+    let response: TurnStartResponse = client
+        .request_typed(ClientRequest::TurnStart {
+            request_id: next_request_id(request_id),
+            params: TurnStartParams {
+                thread_id: fork_id.to_string(),
+                input: vec![UserInput::Text {
+                    text: SUMMARY_PROMPT.to_string(),
+                    text_elements: Vec::new(),
+                }],
+                model: Some(SUMMARY_MODEL.to_string()),
+                effort: Some(ReasoningEffort::Low),
+                output_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string",
+                            "maxLength": 40
+                        }
+                    },
+                    "required": ["summary"],
+                    "additionalProperties": false
+                })),
+                ..TurnStartParams::default()
+            },
+        })
+        .await
+        .context("start summary turn")?;
+    let turn_id = response.turn.id;
+
+    loop {
+        match client.next_event().await {
+            Some(AppServerEvent::ServerNotification(notification)) => {
+                if let ServerNotification::TurnCompleted(completed) = *notification
+                    && completed.thread_id == fork_id
+                    && completed.turn.id == turn_id
+                {
+                    if completed.turn.status != TurnStatus::Completed {
+                        bail!("summary turn ended with {:?}", completed.turn.status);
+                    }
+                    return summary_from_items(&completed.turn.items);
+                }
+            }
+            Some(AppServerEvent::Disconnected { message }) => bail!(message),
+            None => bail!("summary app-server connection closed"),
+            _ => {}
+        }
+    }
+}
+
+fn summary_from_items(items: &[ThreadItem]) -> Result<String> {
+    let text = items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            ThreadItem::AgentMessage { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .context("summary turn returned no assistant message")?;
+    let payload: SummaryPayload =
+        serde_json::from_str(text).context("decode structured summary response")?;
+    let summary = normalize_summary(&payload.summary);
+    if summary.is_empty() {
+        bail!("summary response was empty");
+    }
+    Ok(summary)
+}
+
+fn normalize_summary(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(40)
+        .collect()
+}
+
+fn next_request_id(request_id: &mut i64) -> RequestId {
+    let id = *request_id;
+    *request_id += 1;
+    RequestId::Integer(id)
+}
+
+fn refreshes_primary_window(
+    notification: &ServerNotification,
+    windows: &[Window],
+    state_root: &Path,
+) -> bool {
+    let thread_id = match notification {
+        ServerNotification::ThreadStarted(started) if started.thread.ephemeral => return false,
+        ServerNotification::ThreadStarted(started) => &started.thread.id,
+        ServerNotification::ThreadStatusChanged(changed) => &changed.thread_id,
+        ServerNotification::ThreadClosed(closed) => &closed.thread_id,
+        _ => return false,
+    };
+    windows.iter().any(|window| window.thread_id == *thread_id)
+        || primary_sessions(state_root)
+            .is_ok_and(|sessions| sessions.iter().any(|(_, primary)| primary == thread_id))
+}
+
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     mut client: RemoteAppServerClient,
@@ -409,6 +771,11 @@ async fn run(
     mut request_id: i64,
     mut windows: Vec<Window>,
     mut teleporter: Teleporter,
+    cache: &mut SummaryCache,
+    cache_path: PathBuf,
+    summary_jobs: mpsc::UnboundedSender<SummaryJob>,
+    mut summary_results: mpsc::UnboundedReceiver<SummaryResult>,
+    mut attempted_summaries: HashSet<(String, String)>,
 ) -> Result<()> {
     let mut terminal_events = EventStream::new();
     let mut offset = 0;
@@ -488,15 +855,10 @@ async fn run(
             event = client.next_event() => {
                 match event {
                     Some(AppServerEvent::ServerNotification(notification))
-                        if matches!(
-                            *notification,
-                            ServerNotification::ThreadStarted(_)
-                                | ServerNotification::ThreadStatusChanged(_)
-                                | ServerNotification::ThreadClosed(_)
-                        ) =>
+                        if refreshes_primary_window(&notification, &windows, &state_root) =>
                     {
                         let selected_slug = windows.get(selected).map(|window| window.slug.clone());
-                        let next = load_windows(&client, &state_root, &mut request_id).await?;
+                        let next = load_windows(&client, &state_root, cache, &mut request_id).await?;
                         if next != windows {
                             windows = next;
                             selected = selected_slug
@@ -509,10 +871,39 @@ async fn run(
                             );
                             terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
                         }
+                        schedule_summaries(
+                            &windows,
+                            &mut attempted_summaries,
+                            &summary_jobs,
+                        );
                     }
                     Some(AppServerEvent::Disconnected { message }) => bail!(message),
                     None => bail!("shared Codex app-server connection closed"),
                     _ => {}
+                }
+            }
+            result = summary_results.recv() => {
+                let Some(result) = result else {
+                    continue;
+                };
+                if let Ok(summary) = result.summary {
+                    cache.entries.insert(
+                        result.job.thread_id.clone(),
+                        SummaryCacheEntry {
+                            turn_id: result.job.turn_id.clone(),
+                            summary: summary.clone(),
+                        },
+                    );
+                    save_summary_cache(&cache_path, cache)?;
+                    if let Some(window) = windows.iter_mut().find(|window| {
+                        window.thread_id == result.job.thread_id
+                            && window.completed_turn_id.as_deref()
+                                == Some(result.job.turn_id.as_str())
+                    }) {
+                        window.summary = Some(summary);
+                        window.summary_turn_id = Some(result.job.turn_id);
+                        terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+                    }
                 }
             }
         }
@@ -574,7 +965,12 @@ fn draw(frame: &mut Frame<'_>, windows: &[Window], offset: usize, selected: usiz
                     format!("{:<20}", window.slug),
                     Style::default().fg(Color::Cyan),
                 ),
-                Span::raw(preview(&window.preview)),
+                Span::raw(
+                    window
+                        .summary
+                        .clone()
+                        .unwrap_or_else(|| preview(&window.preview)),
+                ),
             ]);
             if offset + index == selected {
                 line.style(Style::default().bg(Color::DarkGray))
