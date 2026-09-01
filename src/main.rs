@@ -126,6 +126,12 @@ impl Teleporter {
         }
         Ok(())
     }
+
+    async fn focus(&self) -> Result<()> {
+        tmux_status(["select-pane", "-t", self.viewport_pane.as_str()])
+            .await
+            .context("focus Puzzle viewport pane")
+    }
 }
 
 async fn create_viewport(puzzle_pane: &str, window_id: &str) -> Result<String> {
@@ -455,6 +461,7 @@ async fn run(
                             }
                             KeyCode::Enter if !windows.is_empty() => {
                                 teleporter.show(&windows[selected].slug).await?;
+                                teleporter.focus().await?;
                             }
                             _ => {}
                         }
