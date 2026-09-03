@@ -92,6 +92,13 @@ struct SummaryResult {
     summary: Result<String, String>,
 }
 
+#[derive(Debug)]
+struct CompletedTurnResult {
+    thread_id: String,
+    generation: u64,
+    completed_turn_id: Result<Option<String>>,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct SummaryCache {
     version: u32,
@@ -534,13 +541,38 @@ async fn load_windows(
         });
     }
 
+    sort_windows(&mut windows);
+    Ok(windows)
+}
+
+fn sort_windows(windows: &mut [Window]) {
     windows.sort_by(|left, right| {
         right
             .recency_at
             .cmp(&left.recency_at)
             .then_with(|| left.slug.cmp(&right.slug))
     });
-    Ok(windows)
+}
+
+fn recent_turns_request(thread_id: String, request_id: RequestId) -> ClientRequest {
+    ClientRequest::ThreadTurnsList {
+        request_id,
+        params: ThreadTurnsListParams {
+            thread_id,
+            cursor: None,
+            limit: Some(4),
+            sort_direction: Some(SortDirection::Desc),
+            items_view: Some(TurnItemsView::NotLoaded),
+        },
+    }
+}
+
+fn completed_turn_id(response: ThreadTurnsListResponse) -> Option<String> {
+    response
+        .data
+        .into_iter()
+        .find(|turn| turn.status == TurnStatus::Completed)
+        .map(|turn| turn.id)
 }
 
 async fn latest_completed_turn(
@@ -548,26 +580,37 @@ async fn latest_completed_turn(
     thread_id: &str,
     request_id: &mut i64,
 ) -> Result<Option<String>> {
-    let id = *request_id;
-    *request_id += 1;
     let response: ThreadTurnsListResponse = client
-        .request_typed(ClientRequest::ThreadTurnsList {
-            request_id: RequestId::Integer(id),
-            params: ThreadTurnsListParams {
-                thread_id: thread_id.to_string(),
-                cursor: None,
-                limit: Some(4),
-                sort_direction: Some(SortDirection::Desc),
-                items_view: Some(TurnItemsView::NotLoaded),
-            },
-        })
+        .request_typed(recent_turns_request(
+            thread_id.to_string(),
+            next_request_id(request_id),
+        ))
         .await
         .context("list recent Codex turns")?;
-    Ok(response
-        .data
-        .into_iter()
-        .find(|turn| turn.status == TurnStatus::Completed)
-        .map(|turn| turn.id))
+    Ok(completed_turn_id(response))
+}
+
+fn schedule_summary(
+    window: &Window,
+    attempted: &mut HashSet<(String, String)>,
+    jobs: &mpsc::UnboundedSender<SummaryJob>,
+) {
+    if window.status != ThreadStatus::Idle {
+        return;
+    }
+    let Some(turn_id) = &window.completed_turn_id else {
+        return;
+    };
+    if window.summary_turn_id.as_deref() == Some(turn_id) {
+        return;
+    }
+    let key = (window.thread_id.clone(), turn_id.clone());
+    if attempted.insert(key) {
+        let _ = jobs.send(SummaryJob {
+            thread_id: window.thread_id.clone(),
+            turn_id: turn_id.clone(),
+        });
+    }
 }
 
 fn schedule_summaries(
@@ -576,22 +619,7 @@ fn schedule_summaries(
     jobs: &mpsc::UnboundedSender<SummaryJob>,
 ) {
     for window in windows {
-        if window.status != ThreadStatus::Idle {
-            continue;
-        }
-        let Some(turn_id) = &window.completed_turn_id else {
-            continue;
-        };
-        if window.summary_turn_id.as_deref() == Some(turn_id) {
-            continue;
-        }
-        let key = (window.thread_id.clone(), turn_id.clone());
-        if attempted.insert(key) {
-            let _ = jobs.send(SummaryJob {
-                thread_id: window.thread_id.clone(),
-                turn_id: turn_id.clone(),
-            });
-        }
+        schedule_summary(window, attempted, jobs);
     }
 }
 
@@ -747,21 +775,8 @@ fn next_request_id(request_id: &mut i64) -> RequestId {
     RequestId::Integer(id)
 }
 
-fn refreshes_primary_window(
-    notification: &ServerNotification,
-    windows: &[Window],
-    state_root: &Path,
-) -> bool {
-    let thread_id = match notification {
-        ServerNotification::ThreadStarted(started) if started.thread.ephemeral => return false,
-        ServerNotification::ThreadStarted(started) => &started.thread.id,
-        ServerNotification::ThreadStatusChanged(changed) => &changed.thread_id,
-        ServerNotification::ThreadClosed(closed) => &closed.thread_id,
-        _ => return false,
-    };
-    windows.iter().any(|window| window.thread_id == *thread_id)
-        || primary_sessions(state_root)
-            .is_ok_and(|sessions| sessions.iter().any(|(_, primary)| primary == thread_id))
+fn is_active(status: &ThreadStatus) -> bool {
+    matches!(status, ThreadStatus::Active { .. })
 }
 
 async fn run(
@@ -778,6 +793,9 @@ async fn run(
     mut attempted_summaries: HashSet<(String, String)>,
 ) -> Result<()> {
     let mut terminal_events = EventStream::new();
+    let request_handle = client.request_handle();
+    let (completed_turn_tx, mut completed_turn_results) = mpsc::channel(8);
+    let mut thread_generations = HashMap::<String, u64>::new();
     let mut offset = 0;
     let mut selected = 0;
     terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
@@ -854,33 +872,168 @@ async fn run(
             }
             event = client.next_event() => {
                 match event {
-                    Some(AppServerEvent::ServerNotification(notification))
-                        if refreshes_primary_window(&notification, &windows, &state_root) =>
-                    {
-                        let selected_slug = windows.get(selected).map(|window| window.slug.clone());
-                        let next = load_windows(&client, &state_root, cache, &mut request_id).await?;
-                        if next != windows {
-                            windows = next;
-                            selected = selected_slug
-                                .and_then(|slug| windows.iter().position(|window| window.slug == slug))
-                                .unwrap_or_else(|| selected.min(windows.len().saturating_sub(1)));
-                            offset = keep_visible(
-                                selected,
-                                offset,
-                                visible_rows(terminal.size()?.height),
-                            );
-                            terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+                    Some(AppServerEvent::ServerNotification(notification)) => {
+                        match *notification {
+                            ServerNotification::ThreadStatusChanged(changed) => {
+                                let Some(position) = windows
+                                    .iter()
+                                    .position(|window| window.thread_id == changed.thread_id)
+                                else {
+                                    continue;
+                                };
+                                let previous_status = windows[position].status.clone();
+                                let became_active =
+                                    !is_active(&previous_status) && is_active(&changed.status);
+                                let became_idle = previous_status != ThreadStatus::Idle
+                                    && changed.status == ThreadStatus::Idle;
+                                let generation = thread_generations
+                                    .entry(changed.thread_id.clone())
+                                    .or_default();
+                                *generation += 1;
+                                let generation = *generation;
+
+                                windows[position].status = changed.status;
+                                if became_active {
+                                    let recency_at = windows
+                                        .iter()
+                                        .map(|window| window.recency_at)
+                                        .max()
+                                        .unwrap_or_default()
+                                        + 1;
+                                    windows[position].recency_at = recency_at;
+                                    let selected_slug = windows
+                                        .get(selected)
+                                        .map(|window| window.slug.clone());
+                                    sort_windows(&mut windows);
+                                    selected = selected_slug
+                                        .and_then(|slug| {
+                                            windows
+                                                .iter()
+                                                .position(|window| window.slug == slug)
+                                        })
+                                        .unwrap_or_else(|| {
+                                            selected.min(windows.len().saturating_sub(1))
+                                        });
+                                    offset = keep_visible(
+                                        selected,
+                                        offset,
+                                        visible_rows(terminal.size()?.height),
+                                    );
+                                }
+                                terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+
+                                if became_idle {
+                                    let client = request_handle.clone();
+                                    let results = completed_turn_tx.clone();
+                                    let thread_id = changed.thread_id;
+                                    let lookup_request_id = next_request_id(&mut request_id);
+                                    tokio::spawn(async move {
+                                        let completed_turn_id = async {
+                                            let response: ThreadTurnsListResponse = client
+                                                .request_typed(recent_turns_request(
+                                                    thread_id.clone(),
+                                                    lookup_request_id,
+                                                ))
+                                                .await
+                                                .context("list recent Codex turns")?;
+                                            Ok::<_, anyhow::Error>(completed_turn_id(response))
+                                        }
+                                        .await
+                                        .with_context(|| {
+                                            format!(
+                                                "read latest completed turn for thread {thread_id}"
+                                            )
+                                        });
+                                        let _ = results
+                                            .send(CompletedTurnResult {
+                                                thread_id,
+                                                generation,
+                                                completed_turn_id,
+                                            })
+                                            .await;
+                                    });
+                                }
+                            }
+                            ServerNotification::ThreadStarted(started)
+                                if !started.thread.ephemeral
+                                    && !windows.iter().any(|window| {
+                                        window.thread_id == started.thread.id
+                                    })
+                                    && primary_sessions(&state_root).is_ok_and(|sessions| {
+                                        sessions.iter().any(|(_, thread_id)| {
+                                            thread_id == &started.thread.id
+                                        })
+                                    }) =>
+                            {
+                                for generation in thread_generations.values_mut() {
+                                    *generation += 1;
+                                }
+                                let selected_slug = windows
+                                    .get(selected)
+                                    .map(|window| window.slug.clone());
+                                let next =
+                                    load_windows(&client, &state_root, cache, &mut request_id).await?;
+                                if next != windows {
+                                    windows = next;
+                                    selected = selected_slug
+                                        .and_then(|slug| {
+                                            windows
+                                                .iter()
+                                                .position(|window| window.slug == slug)
+                                        })
+                                        .unwrap_or_else(|| {
+                                            selected.min(windows.len().saturating_sub(1))
+                                        });
+                                    offset = keep_visible(
+                                        selected,
+                                        offset,
+                                        visible_rows(terminal.size()?.height),
+                                    );
+                                    terminal.draw(|frame| {
+                                        draw(frame, &windows, offset, selected)
+                                    })?;
+                                }
+                                schedule_summaries(
+                                    &windows,
+                                    &mut attempted_summaries,
+                                    &summary_jobs,
+                                );
+                            }
+                            _ => {}
                         }
-                        schedule_summaries(
-                            &windows,
-                            &mut attempted_summaries,
-                            &summary_jobs,
-                        );
                     }
                     Some(AppServerEvent::Disconnected { message }) => bail!(message),
                     None => bail!("shared Codex app-server connection closed"),
                     _ => {}
                 }
+            }
+            result = completed_turn_results.recv() => {
+                let Some(result) = result else {
+                    continue;
+                };
+                if thread_generations.get(&result.thread_id).copied()
+                    != Some(result.generation)
+                {
+                    continue;
+                }
+                let Some(position) = windows
+                    .iter()
+                    .position(|window| window.thread_id == result.thread_id)
+                else {
+                    continue;
+                };
+                if windows[position].status != ThreadStatus::Idle {
+                    continue;
+                }
+                let Ok(completed_turn_id) = result.completed_turn_id else {
+                    continue;
+                };
+                windows[position].completed_turn_id = completed_turn_id;
+                schedule_summary(
+                    &windows[position],
+                    &mut attempted_summaries,
+                    &summary_jobs,
+                );
             }
             result = summary_results.recv() => {
                 let Some(result) = result else {
