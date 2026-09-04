@@ -26,5 +26,7 @@ Use `j` and `k` or the arrow keys to move through the windows, wrapping at both
 ends. Each movement opens the selected window before accepting another key.
 The first visit starts a client in the detached `puzzle-parking` tmux session;
 later visits swap the existing client immediately. Enter moves focus into the
-displayed client. Press `q`, Escape, or Control-C to exit Puzzle without
-stopping those clients.
+displayed client. Press `/` to find windows by slug or displayed description;
+type to narrow the list, use the arrow keys to move through matches, and press
+Escape to clear the find. Press `q` or Escape outside find, or Control-C at any
+time, to exit Puzzle without stopping those clients.

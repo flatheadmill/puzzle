@@ -779,6 +779,183 @@ fn is_active(status: &ThreadStatus) -> bool {
     matches!(status, ThreadStatus::Active { .. })
 }
 
+fn displayed_description(window: &Window) -> String {
+    window
+        .summary
+        .clone()
+        .unwrap_or_else(|| preview(&window.preview))
+}
+
+fn matching_indices(windows: &[Window], query: Option<&str>) -> Vec<usize> {
+    let Some(query) = query else {
+        return (0..windows.len()).collect();
+    };
+    let query = query.to_lowercase();
+    windows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, window)| {
+            (window.slug.to_lowercase().contains(&query)
+                || displayed_description(window)
+                    .to_lowercase()
+                    .contains(&query))
+            .then_some(index)
+        })
+        .collect()
+}
+
+fn keep_match_visible(
+    selected: Option<usize>,
+    offset: usize,
+    page: usize,
+    match_count: usize,
+) -> usize {
+    if match_count == 0 || page == 0 {
+        return 0;
+    }
+    let max_offset = match_count.saturating_sub(page);
+    let offset = offset.min(max_offset);
+    selected
+        .map(|selected| keep_visible(selected, offset, page).min(max_offset))
+        .unwrap_or(offset)
+}
+
+struct ViewState {
+    query: Option<String>,
+    selected_slug: Option<String>,
+    matches: Vec<usize>,
+    offset: usize,
+}
+
+impl ViewState {
+    fn new(windows: &[Window]) -> Self {
+        Self {
+            query: None,
+            selected_slug: windows.first().map(|window| window.slug.clone()),
+            matches: (0..windows.len()).collect(),
+            offset: 0,
+        }
+    }
+
+    fn selected_match_position(&self, windows: &[Window]) -> Option<usize> {
+        let selected_slug = self.selected_slug.as_deref()?;
+        self.matches
+            .iter()
+            .position(|&index| windows[index].slug == selected_slug)
+    }
+
+    fn effective_slug<'a>(&self, windows: &'a [Window]) -> Option<&'a str> {
+        self.selected_match_position(windows)
+            .map(|position| windows[self.matches[position]].slug.as_str())
+    }
+
+    fn effective_slug_owned(&self, windows: &[Window]) -> Option<String> {
+        self.effective_slug(windows).map(str::to_string)
+    }
+
+    fn reconcile(&mut self, windows: &[Window], page: usize) {
+        self.matches = matching_indices(windows, self.query.as_deref());
+        if self
+            .selected_slug
+            .as_deref()
+            .is_some_and(|slug| !windows.iter().any(|window| window.slug == slug))
+        {
+            self.selected_slug = None;
+        }
+        if !self.matches.is_empty() && self.selected_match_position(windows).is_none() {
+            self.selected_slug = Some(windows[self.matches[0]].slug.clone());
+        }
+        self.ensure_visible(windows, page);
+    }
+
+    fn ensure_visible(&mut self, windows: &[Window], page: usize) {
+        self.offset = keep_match_visible(
+            self.selected_match_position(windows),
+            self.offset,
+            page,
+            self.matches.len(),
+        );
+    }
+
+    fn select_relative(&mut self, windows: &[Window], forward: bool) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let next = match (forward, self.selected_match_position(windows)) {
+            (true, Some(position)) => (position + 1) % self.matches.len(),
+            (true, None) => 0,
+            (false, Some(0) | None) => self.matches.len() - 1,
+            (false, Some(position)) => position - 1,
+        };
+        self.selected_slug = Some(windows[self.matches[next]].slug.clone());
+    }
+
+    async fn browse_move(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        teleporter: &mut Teleporter,
+        windows: &[Window],
+        page: usize,
+        forward: bool,
+    ) -> Result<()> {
+        let previous = self.selected_slug.clone();
+        self.select_relative(windows, forward);
+        if self.selected_slug != previous
+            && let Some(slug) = self.selected_slug.clone()
+        {
+            teleporter.show(&slug).await?;
+            self.ensure_visible(windows, page);
+            self.redraw(terminal, windows)?;
+        }
+        Ok(())
+    }
+
+    fn select_first(&mut self, windows: &[Window]) {
+        if let Some(&index) = self.matches.first() {
+            self.selected_slug = Some(windows[index].slug.clone());
+        }
+    }
+
+    fn select_last(&mut self, windows: &[Window]) {
+        if let Some(&index) = self.matches.last() {
+            self.selected_slug = Some(windows[index].slug.clone());
+        }
+    }
+
+    fn redraw(&self, terminal: &mut ratatui::DefaultTerminal, windows: &[Window]) -> Result<()> {
+        terminal.draw(|frame| {
+            draw(
+                frame,
+                windows,
+                &self.matches,
+                self.offset,
+                self.selected_slug.as_deref(),
+                self.query.as_deref(),
+            )
+        })?;
+        Ok(())
+    }
+
+    async fn present_change(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        teleporter: &mut Teleporter,
+        windows: &[Window],
+        previous_effective: Option<String>,
+    ) -> Result<()> {
+        let page = visible_rows(terminal.size()?.height);
+        self.reconcile(windows, page);
+        self.redraw(terminal, windows)?;
+        let effective = self.effective_slug_owned(windows);
+        if effective != previous_effective
+            && let Some(slug) = effective
+        {
+            teleporter.show(&slug).await?;
+        }
+        Ok(())
+    }
+}
+
 async fn run(
     terminal: &mut ratatui::DefaultTerminal,
     mut client: RemoteAppServerClient,
@@ -796,9 +973,8 @@ async fn run(
     let request_handle = client.request_handle();
     let (completed_turn_tx, mut completed_turn_results) = mpsc::channel(8);
     let mut thread_generations = HashMap::<String, u64>::new();
-    let mut offset = 0;
-    let mut selected = 0;
-    terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+    let mut view = ViewState::new(&windows);
+    view.redraw(terminal, &windows)?;
 
     loop {
         tokio::select! {
@@ -808,64 +984,179 @@ async fn run(
                 };
                 match event? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        let quit = matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
-                            || key.code == KeyCode::Char('c')
-                                && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if quit {
+                        let control_c = matches!(key.code, KeyCode::Char('c' | 'C'))
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        if control_c {
                             break;
                         }
                         let page = visible_rows(terminal.size()?.height);
-                        match key.code {
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                let next = if windows.is_empty() || selected + 1 >= windows.len() {
-                                    0
-                                } else {
-                                    selected + 1
-                                };
-                                if next != selected {
-                                    selected = next;
-                                    teleporter.show(&windows[selected].slug).await?;
-                                    offset = keep_visible(selected, offset, page);
-                                    terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+                        if view.query.is_some() {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    let previous_effective = view.effective_slug_owned(&windows);
+                                    view.query = None;
+                                    view.present_change(
+                                        terminal,
+                                        &mut teleporter,
+                                        &windows,
+                                        previous_effective,
+                                    )
+                                    .await?;
                                 }
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                let next = if selected == 0 {
-                                    windows.len().saturating_sub(1)
-                                } else {
-                                    selected - 1
-                                };
-                                if next != selected {
-                                    selected = next;
-                                    teleporter.show(&windows[selected].slug).await?;
-                                    offset = keep_visible(selected, offset, page);
-                                    terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+                                KeyCode::Backspace => {
+                                    let previous_effective = view.effective_slug_owned(&windows);
+                                    if let Some(query) = view.query.as_mut() {
+                                        query.pop();
+                                    }
+                                    view.present_change(
+                                        terminal,
+                                        &mut teleporter,
+                                        &windows,
+                                        previous_effective,
+                                    )
+                                    .await?;
                                 }
+                                KeyCode::Down | KeyCode::Up => {
+                                    let previous_effective = view.effective_slug_owned(&windows);
+                                    view.select_relative(
+                                        &windows,
+                                        key.code == KeyCode::Down,
+                                    );
+                                    view.present_change(
+                                        terminal,
+                                        &mut teleporter,
+                                        &windows,
+                                        previous_effective,
+                                    )
+                                    .await?;
+                                }
+                                KeyCode::Home => {
+                                    let previous_effective = view.effective_slug_owned(&windows);
+                                    view.select_first(&windows);
+                                    view.present_change(
+                                        terminal,
+                                        &mut teleporter,
+                                        &windows,
+                                        previous_effective,
+                                    )
+                                    .await?;
+                                }
+                                KeyCode::End => {
+                                    let previous_effective = view.effective_slug_owned(&windows);
+                                    view.select_last(&windows);
+                                    view.present_change(
+                                        terminal,
+                                        &mut teleporter,
+                                        &windows,
+                                        previous_effective,
+                                    )
+                                    .await?;
+                                }
+                                KeyCode::Enter => {
+                                    let target = if view.matches.is_empty() {
+                                        view.selected_slug.clone().filter(|slug| {
+                                            windows
+                                                .iter()
+                                                .any(|window| window.slug == slug.as_str())
+                                        })
+                                    } else {
+                                        view.effective_slug_owned(&windows)
+                                    };
+                                    view.query = None;
+                                    view.reconcile(&windows, page);
+                                    view.redraw(terminal, &windows)?;
+                                    if let Some(slug) = target {
+                                        teleporter.show(&slug).await?;
+                                        teleporter.focus().await?;
+                                    }
+                                }
+                                KeyCode::Char(character)
+                                    if (key.modifiers.is_empty()
+                                        || key.modifiers == KeyModifiers::SHIFT)
+                                        && !character.is_control() =>
+                                {
+                                    let previous_effective = view.effective_slug_owned(&windows);
+                                    if let Some(query) = view.query.as_mut() {
+                                        query.push(character);
+                                    }
+                                    view.present_change(
+                                        terminal,
+                                        &mut teleporter,
+                                        &windows,
+                                        previous_effective,
+                                    )
+                                    .await?;
+                                }
+                                _ => {}
                             }
-                            KeyCode::Home | KeyCode::Char('g') => {
-                                selected = 0;
-                                offset = 0;
-                                terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+                        } else {
+                            let quit = matches!(key.code, KeyCode::Esc | KeyCode::Char('q'));
+                            if quit {
+                                break;
                             }
-                            KeyCode::End | KeyCode::Char('G') => {
-                                selected = windows.len().saturating_sub(1);
-                                offset = keep_visible(selected, offset, page);
-                                terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+                            match key.code {
+                                KeyCode::Char('/')
+                                    if key.modifiers.is_empty()
+                                        || key.modifiers == KeyModifiers::SHIFT =>
+                                {
+                                    let previous_effective = view.effective_slug_owned(&windows);
+                                    view.query = Some(String::new());
+                                    view.present_change(
+                                        terminal,
+                                        &mut teleporter,
+                                        &windows,
+                                        previous_effective,
+                                    )
+                                    .await?;
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    view.browse_move(
+                                        terminal,
+                                        &mut teleporter,
+                                        &windows,
+                                        page,
+                                        true,
+                                    )
+                                    .await?;
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    view.browse_move(
+                                        terminal,
+                                        &mut teleporter,
+                                        &windows,
+                                        page,
+                                        false,
+                                    )
+                                    .await?;
+                                }
+                                KeyCode::Home | KeyCode::Char('g') => {
+                                    if !view.matches.is_empty() {
+                                        view.select_first(&windows);
+                                        view.offset = 0;
+                                        view.redraw(terminal, &windows)?;
+                                    }
+                                }
+                                KeyCode::End | KeyCode::Char('G') => {
+                                    if !view.matches.is_empty() {
+                                        view.select_last(&windows);
+                                        view.ensure_visible(&windows, page);
+                                        view.redraw(terminal, &windows)?;
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(slug) = view.effective_slug(&windows) {
+                                        teleporter.show(slug).await?;
+                                        teleporter.focus().await?;
+                                    }
+                                }
+                                _ => {}
                             }
-                            KeyCode::Enter if !windows.is_empty() => {
-                                teleporter.show(&windows[selected].slug).await?;
-                                teleporter.focus().await?;
-                            }
-                            _ => {}
                         }
                     }
                     Event::Resize(_, _) => {
-                        offset = keep_visible(
-                            selected,
-                            offset,
-                            visible_rows(terminal.size()?.height),
-                        );
-                        terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+                        let page = visible_rows(terminal.size()?.height);
+                        view.ensure_visible(&windows, page);
+                        view.redraw(terminal, &windows)?;
                     }
                     _ => {}
                 }
@@ -881,6 +1172,7 @@ async fn run(
                                 else {
                                     continue;
                                 };
+                                let previous_effective = view.effective_slug_owned(&windows);
                                 let previous_status = windows[position].status.clone();
                                 let became_active =
                                     !is_active(&previous_status) && is_active(&changed.status);
@@ -901,26 +1193,15 @@ async fn run(
                                         .unwrap_or_default()
                                         + 1;
                                     windows[position].recency_at = recency_at;
-                                    let selected_slug = windows
-                                        .get(selected)
-                                        .map(|window| window.slug.clone());
                                     sort_windows(&mut windows);
-                                    selected = selected_slug
-                                        .and_then(|slug| {
-                                            windows
-                                                .iter()
-                                                .position(|window| window.slug == slug)
-                                        })
-                                        .unwrap_or_else(|| {
-                                            selected.min(windows.len().saturating_sub(1))
-                                        });
-                                    offset = keep_visible(
-                                        selected,
-                                        offset,
-                                        visible_rows(terminal.size()?.height),
-                                    );
                                 }
-                                terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+                                view.present_change(
+                                    terminal,
+                                    &mut teleporter,
+                                    &windows,
+                                    previous_effective,
+                                )
+                                .await?;
 
                                 if became_idle {
                                     let client = request_handle.clone();
@@ -965,33 +1246,21 @@ async fn run(
                                         })
                                     }) =>
                             {
+                                let previous_effective = view.effective_slug_owned(&windows);
                                 for generation in thread_generations.values_mut() {
                                     *generation += 1;
                                 }
-                                let selected_slug = windows
-                                    .get(selected)
-                                    .map(|window| window.slug.clone());
                                 let next =
                                     load_windows(&client, &state_root, cache, &mut request_id).await?;
                                 if next != windows {
                                     windows = next;
-                                    selected = selected_slug
-                                        .and_then(|slug| {
-                                            windows
-                                                .iter()
-                                                .position(|window| window.slug == slug)
-                                        })
-                                        .unwrap_or_else(|| {
-                                            selected.min(windows.len().saturating_sub(1))
-                                        });
-                                    offset = keep_visible(
-                                        selected,
-                                        offset,
-                                        visible_rows(terminal.size()?.height),
-                                    );
-                                    terminal.draw(|frame| {
-                                        draw(frame, &windows, offset, selected)
-                                    })?;
+                                    view.present_change(
+                                        terminal,
+                                        &mut teleporter,
+                                        &windows,
+                                        previous_effective,
+                                    )
+                                    .await?;
                                 }
                                 schedule_summaries(
                                     &windows,
@@ -1048,14 +1317,21 @@ async fn run(
                         },
                     );
                     save_summary_cache(&cache_path, cache)?;
-                    if let Some(window) = windows.iter_mut().find(|window| {
+                    if let Some(position) = windows.iter().position(|window| {
                         window.thread_id == result.job.thread_id
                             && window.completed_turn_id.as_deref()
                                 == Some(result.job.turn_id.as_str())
                     }) {
-                        window.summary = Some(summary);
-                        window.summary_turn_id = Some(result.job.turn_id);
-                        terminal.draw(|frame| draw(frame, &windows, offset, selected))?;
+                        let previous_effective = view.effective_slug_owned(&windows);
+                        windows[position].summary = Some(summary);
+                        windows[position].summary_turn_id = Some(result.job.turn_id);
+                        view.present_change(
+                            terminal,
+                            &mut teleporter,
+                            &windows,
+                            previous_effective,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -1093,7 +1369,14 @@ fn preview(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn draw(frame: &mut Frame<'_>, windows: &[Window], offset: usize, selected: usize) {
+fn draw(
+    frame: &mut Frame<'_>,
+    windows: &[Window],
+    matches: &[usize],
+    offset: usize,
+    selected_slug: Option<&str>,
+    query: Option<&str>,
+) {
     let area = frame.area();
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -1105,12 +1388,12 @@ fn draw(frame: &mut Frame<'_>, windows: &[Window], offset: usize, selected: usiz
     let title = format!("{} primary Codex windows", windows.len());
     frame.render_widget(Paragraph::new(title), header);
 
-    let rows = windows
+    let rows = matches
         .iter()
         .skip(offset)
         .take(visible_rows(area.height))
-        .enumerate()
-        .map(|(index, window)| {
+        .map(|&index| {
+            let window = &windows[index];
             let (status, color) = status(&window.status);
             let line = Line::from(vec![
                 Span::styled(format!("{status:<10}"), Style::default().fg(color)),
@@ -1118,14 +1401,9 @@ fn draw(frame: &mut Frame<'_>, windows: &[Window], offset: usize, selected: usiz
                     format!("{:<20}", window.slug),
                     Style::default().fg(Color::Cyan),
                 ),
-                Span::raw(
-                    window
-                        .summary
-                        .clone()
-                        .unwrap_or_else(|| preview(&window.preview)),
-                ),
+                Span::raw(displayed_description(window)),
             ]);
-            if offset + index == selected {
+            if selected_slug == Some(window.slug.as_str()) {
                 line.style(Style::default().bg(Color::DarkGray))
             } else {
                 line
@@ -1134,21 +1412,96 @@ fn draw(frame: &mut Frame<'_>, windows: &[Window], offset: usize, selected: usiz
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(rows), body);
 
-    let position = if windows.len() <= visible_rows(area.height) {
+    let position = if matches.len() <= visible_rows(area.height) {
         String::new()
     } else {
         format!(
             "  {}-{} of {}",
             offset + 1,
-            (offset + visible_rows(area.height)).min(windows.len()),
-            windows.len()
+            (offset + visible_rows(area.height)).min(matches.len()),
+            matches.len()
         )
     };
+    let footer_text = match query {
+        Some(query) if matches.is_empty() => format!("find /{query}  no matches  Esc clear"),
+        Some(query) => format!(
+            "find /{query}  {} {}  Up/Down select  Enter open  Esc clear",
+            matches.len(),
+            if matches.len() == 1 {
+                "match"
+            } else {
+                "matches"
+            }
+        ),
+        None => format!("j/k select  g/G first/last  / find  Enter open  q quit{position}"),
+    };
     frame.render_widget(
-        Paragraph::new(format!(
-            "j/k select  g/G first/last  Enter open  q quit{position}"
-        ))
-        .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(footer_text).style(Style::default().fg(Color::DarkGray)),
         footer,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(slug: &str, preview: &str, summary: Option<&str>) -> Window {
+        Window {
+            slug: slug.to_string(),
+            thread_id: format!("{slug}-thread"),
+            completed_turn_id: None,
+            preview: preview.to_string(),
+            summary: summary.map(str::to_string),
+            summary_turn_id: None,
+            status: ThreadStatus::Idle,
+            recency_at: 0,
+        }
+    }
+
+    #[test]
+    fn matches_slug_and_exact_displayed_description_case_insensitively() {
+        let windows = vec![
+            window("Alpha", "needle preview", Some("Finished work")),
+            window("Beta", "Needle\n  preview", None),
+        ];
+
+        assert_eq!(matching_indices(&windows, Some("ALP")), vec![0]);
+        assert_eq!(matching_indices(&windows, Some("finished")), vec![0]);
+        assert_eq!(matching_indices(&windows, Some("needle preview")), vec![1]);
+    }
+
+    #[test]
+    fn retains_selection_through_zero_matches_and_clears_it_if_removed() {
+        let windows = vec![
+            window("alpha", "first", None),
+            window("beta", "second", None),
+        ];
+        let mut view = ViewState::new(&windows);
+
+        view.query = Some("missing".to_string());
+        view.reconcile(&windows, 10);
+        assert!(view.matches.is_empty());
+        assert_eq!(view.selected_slug.as_deref(), Some("alpha"));
+        assert_eq!(view.effective_slug(&windows), None);
+
+        view.query = Some("alpha".to_string());
+        view.reconcile(&windows, 10);
+        assert_eq!(view.effective_slug(&windows), Some("alpha"));
+
+        view.query = Some("beta".to_string());
+        view.reconcile(&windows, 10);
+        assert_eq!(view.effective_slug(&windows), Some("beta"));
+
+        view.query = Some("missing".to_string());
+        view.reconcile(&windows[..1], 10);
+        assert_eq!(view.selected_slug, None);
+    }
+
+    #[test]
+    fn keeps_offsets_in_match_coordinates() {
+        assert_eq!(keep_match_visible(Some(4), 0, 3, 5), 2);
+        assert_eq!(keep_match_visible(Some(0), 4, 3, 1), 0);
+        assert_eq!(keep_match_visible(None, 2, 3, 0), 0);
+        assert_eq!(keep_match_visible(Some(0), 2, 0, 5), 0);
+    }
 }
